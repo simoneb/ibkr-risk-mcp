@@ -84,14 +84,14 @@ class TestCurve:
         zero = next(r for r in result["curve"] if r["shock"] == 0.0)
         assert zero["pnl_total"] == pytest.approx(0.0, abs=1e-6)
 
-    def test_a_short_put_book_troughs_on_the_downside(self, units, shocks):
+    def test_the_fixture_troughs_on_the_downside(self, units, shocks):
         result, _ = curve(units, shocks)
         assert result["trough"]["shock"] < 0
         assert result["trough"]["pnl"] < 0
 
     def test_a_minimum_on_the_edge_of_the_range_is_labelled_as_one(self, units, shocks):
-        """This book is net short downside and long a future, so it just keeps
-        losing: the worst point of a −30%…+30% run sits on the boundary. Calling
+        """This fixture keeps losing all the way down, so the worst point of a
+        −30%…+30% run sits on the boundary. Calling
         that "the trough" would understate the risk by everything beyond it, so
         the engine flags it and says to widen the range."""
         result, _ = curve(units, shocks)
@@ -101,13 +101,13 @@ class TestCurve:
         assert "troughRefined" not in result
 
     def test_an_interior_trough_is_refined_and_not_flagged(self, units, shocks):
-        """Buy far out-of-the-money puts and the curve turns inside the window:
-        below their strike they outrun the short book and the P&L climbs again.
+        """Add long far out-of-the-money puts and the curve turns inside the
+        window: below their strike they outrun the rest and the P&L climbs again.
 
-        A linear hedge cannot produce this. Short options give a concave curve
-        whose minima are always at the edges, so it takes long gamma below the
-        book to put a trough in the middle — which is the whole reason anyone
-        asks this server where the trough is.
+        A linear hedge cannot produce this. Written options make a curve
+        concave, and a concave curve has its minima at the edges, so it takes
+        long gamma below to put a trough in the middle — which is the whole
+        reason anyone asks this server where the trough is.
         """
         protection = S.RiskUnit(
             key="hedge",
@@ -188,8 +188,8 @@ class TestVolModes:
         assert S.shocked_vol(opt, 0.0, cfg, {}) == pytest.approx(opt.iv + 0.05)
 
     def test_a_vol_bump_costs_a_net_short_vega_book_money(self, units, shocks):
-        """At the money the fixture is net short vega — short 10 and 5 against
-        long 10 — so a five-point bump is a loss with the underlying unchanged.
+        """At the money the fixture has negative vega on balance, so a five-point
+        bump is a loss with the underlying unchanged.
 
         Note that this does *not* hold at every shock: thirty percent lower the
         long 5500 puts are the least deep in the money and carry the most vega,

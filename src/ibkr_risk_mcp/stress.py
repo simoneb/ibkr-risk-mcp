@@ -343,9 +343,9 @@ def shocked_vol(
     """The volatility to reprice this contract at, under this shock.
 
     ``sticky_strike`` — the strike keeps its volatility. This is the default and
-    it is what Risk Navigator's default curve does; it is also the conservative
-    choice for a short-put book, since it does not let a falling market hand the
-    position a lower volatility.
+    it is what Risk Navigator's default curve does. It is also the conservative
+    choice, since it does not let a falling market hand a position a lower
+    volatility than the one it holds today.
 
     ``sticky_moneyness`` — the smile travels with the forward, so the strike
     picks up the volatility that currently belongs to its new moneyness. The
@@ -448,8 +448,8 @@ def trough_of(points: list[tuple[float, float]]) -> dict[str, Any]:
         out["note"] = (
             f"The curve is still falling at {worst[0]:+.0%}, the end of the range asked "
             "for, so this is the worst point *in the window*, not the trough. Widen "
-            "`shocks` to find where it turns — a book that is net short downside may "
-            "simply keep losing."
+            "`shocks` to find where it turns, if it turns at all within a plausible "
+            "range."
         )
     return out
 

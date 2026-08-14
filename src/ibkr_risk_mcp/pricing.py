@@ -14,8 +14,7 @@ rather than a second model that can disagree with the first.
 
 **These are European prices.** Equity options and CME futures options are both
 American, and Black-76 has no early exercise in it. Out of the money the
-difference is negligible, which is where a short-premium book lives; in the
-money it is real. Measured against live IB data on a 75-strike put with spot at
+difference is negligible; in the money it is real. Measured against live IB data on a 75-strike put with spot at
 71.94: 4.51 here against IB's 4.65, a 2.9% shortfall that is the early-exercise
 premium. The stress engine reports that gap per position as ``modelVsMarket``
 rather than absorbing it, so it stays visible instead of quietly biasing a

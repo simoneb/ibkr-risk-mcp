@@ -135,7 +135,7 @@ But that is not universal, and assuming it is would introduce the error it was m
 
 **Reconciliation.** `stress_portfolio` rebuilds the portfolio at zero shock — cash, plus the securities' market value, plus the futures' unrealised P&L — and compares it against `NetLiquidation`. A residual over 1% returns `reconciled: false` with the residual attached. Nothing derived from a portfolio that does not reconcile should be presented as fact.
 
-**A minimum at the edge of the range is not a trough.** If the curve is still falling at −30% the engine says so, rather than reporting the boundary as the worst case. A book that is net short downside may simply keep losing.
+**A minimum at the edge of the range is not a trough.** If the curve is still falling at −30% the engine says so, rather than reporting the boundary as the worst case. Some portfolios simply keep losing past the edge of the window.
 
 ## Known limitations
 
@@ -145,7 +145,7 @@ But that is not universal, and assuming it is would introduce the error it was m
 
 **Volatility surface interpolation is local.** Under `sticky_moneyness` the smile is built from the strikes the portfolio actually holds. Fewer than three on one expiry does not define a slope, and that expiry falls back to `sticky_strike` with a warning rather than being given an invented flat smile. `fetch_skew=true` pulls neighbouring strikes from IB instead, at the cost of more market data requests.
 
-**The local repricing is European; most of these options are American.** Black-76 has no early exercise, while equity options and CME futures options both do. The gap is negligible out of the money — which is where a short-premium book lives — and real once a put is in the money. Measured against live IB data: a 75-strike put with spot at 71.94 priced at 4.51 locally against IB's 4.65, a 2.9% shortfall that is the early-exercise premium and nothing else. It is reported per position as `modelVsMarket` rather than hidden, and it means the curve slightly *understates* losses deep in the money.
+**The local repricing is European; most of these options are American.** Black-76 has no early exercise, while equity options and CME futures options both do. The gap is negligible out of the money and real once an option is in the money. Measured against live IB data: a 75-strike put with spot at 71.94 priced at 4.51 locally against IB's 4.65, a 2.9% shortfall that is the early-exercise premium and nothing else. It is reported per position as `modelVsMarket` rather than hidden, and it means the curve slightly *understates* losses deep in the money.
 
 **Rates are an input, not a measurement.** IB does not publish the rate behind its own model. `IBKR_RISK_FREE_RATE` moves option values by little over the horizons this server deals with, but it is not zero either, and it is part of the `modelVsMarket` residual above.
 
