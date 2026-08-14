@@ -1,0 +1,248 @@
+name: Release
+
+# Two ways in. The everyday one is the button: Actions > Release > Run workflow,
+# pick a bump level, and this does the version bump, the commit, the tag and the
+# release itself — nothing to do locally, and no second place to keep in sync.
+# Equivalently, `gh workflow run release.yml -f bump=patch`.
+#
+# Pushing a tag by hand still releases, for a release prepared locally. That path
+# cannot be folded into the first one: a push made with the default GITHUB_TOKEN
+# deliberately does not trigger further workflows, so a job that pushed a tag
+# would never set off a tag-triggered release. Hence one workflow that both
+# creates the tag and releases it, rather than two chained by the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version instead, e.g. 0.4.0 (wins over the bump level)
+        type: string
+
+  push:
+    tags: ['v*']
+
+# Two releases at once would race on the tag and on the version bump.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Tests run before anything is tagged, so a failing tree cannot become a
+  # release. On the manual path this is what stands between a button press and a
+  # bad version being published.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+      # Same explicit environment as ci.yml, for the same two reasons.
+      - run: uv venv --allow-existing
+      - run: uv pip install -e ".[dev]"
+      - run: uv run pytest -q
+
+  # Settles what version is being released, and on the manual path brings the
+  # repository to it. Both paths end with a tag that exists and a pyproject that
+  # agrees with it.
+  prepare:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The bump commit belongs on the default branch, not on the detached
+          # HEAD a tag push checks out.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+          PUSHED_TAG: ${{ github.ref_name }}
+        # Outputs are written to $GITHUB_OUTPUT from inside the script, not by
+        # redirecting it: git prints to stdout too, and its "[master abc] Release
+        # 0.3.1" lands in the output file as an invalid line.
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, subprocess
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a")
+          emit = lambda **kw: [print(f"{k}={v}", file=out) for k, v in kw.items()]
+
+          pyproject = pathlib.Path("pyproject.toml")
+          text = pyproject.read_text(encoding="utf-8")
+          current = re.search(r'^version = "(.+?)"', text, re.M).group(1)
+
+          # The bundle manifest carries its own version, and Claude Desktop shows
+          # that one. Two places to keep in step, so neither is edited by hand.
+          manifest = pathlib.Path("manifest.json")
+          manifest_text = manifest.read_text(encoding="utf-8")
+          manifest_version = re.search(r'"version": "(.+?)"', manifest_text).group(1)
+          if manifest_version != current:
+              raise SystemExit(
+                  f"::error::manifest.json is {manifest_version} but pyproject is {current}"
+              )
+
+          if os.environ["EVENT"] == "push":
+              # The tag is the claim; pyproject has to back it up. Releasing a
+              # package that reports a version other than its tag is a bug this
+              # repository has had once already.
+              version = os.environ["PUSHED_TAG"].removeprefix("v")
+              if version != current:
+                  raise SystemExit(
+                      f"::error::tag v{version} does not match pyproject version {current}"
+                  )
+              emit(tag=f"v{version}", version=version)
+              raise SystemExit(0)
+
+          explicit = os.environ.get("EXPLICIT", "").strip().removeprefix("v")
+          if explicit:
+              if not re.fullmatch(r"\d+\.\d+\.\d+", explicit):
+                  raise SystemExit(f"::error::'{explicit}' is not a X.Y.Z version")
+              version = explicit
+          else:
+              major, minor, patch = (int(p) for p in current.split("."))
+              bump = os.environ["BUMP"]
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  minor, patch = minor + 1, 0
+              else:
+                  patch += 1
+              version = f"{major}.{minor}.{patch}"
+
+          tag = f"v{version}"
+          existing = subprocess.run(
+              ["git", "tag", "--list", tag], capture_output=True, text=True, check=True
+          ).stdout.split()
+          if existing:
+              raise SystemExit(f"::error::{tag} already exists")
+          if version == current:
+              raise SystemExit(f"::error::{version} is already the current version")
+
+          pyproject.write_text(
+              text.replace(f'version = "{current}"', f'version = "{version}"', 1),
+              encoding="utf-8",
+          )
+          manifest.write_text(
+              manifest_text.replace(f'"version": "{current}"', f'"version": "{version}"', 1),
+              encoding="utf-8",
+          )
+
+          # [skip ci] because the push-to-master CI run would only re-test what
+          # this workflow just tested, one commit earlier.
+          run = lambda *args: subprocess.run(args, check=True)
+          run("git", "config", "user.name", "github-actions[bot]")
+          run("git", "config", "user.email",
+              "41898282+github-actions[bot]@users.noreply.github.com")
+          run("git", "commit", "-am", f"Release {version} [skip ci]")
+          run("git", "tag", "-a", tag, "-m", f"ibkr-risk-mcp {version}")
+          run("git", "push", "--follow-tags")
+
+          emit(tag=tag, version=version)
+          PY
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      # The one-click extension for Claude Desktop. Only the manifest and the
+      # sources go in: server.type "uv" means the host resolves dependencies from
+      # pyproject rather than the bundle shipping them.
+      - run: npm install -g @anthropic-ai/mcpb
+      - run: mcpb validate manifest.json
+      # Kept out of dist/ deliberately: the PyPI job publishes everything in
+      # there, and a .mcpb is not a Python distribution.
+      - run: mcpb pack . "bundle/ibkr-risk-mcp-${{ needs.prepare.outputs.version }}.mcpb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: bundle/
+
+  github-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: bundle
+          path: bundle/
+      # The notes are the commit subjects since the previous tag. The install
+      # snippet is spelled out because the README carries <TAG> as a placeholder
+      # rather than a real version — this is where a reader finds one to paste.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          previous=$(git tag --sort=-version:refname | grep -A1 -x "$TAG" | tail -n1)
+          {
+            echo "**Claude Desktop:** download the \`.mcpb\` below and double-click it."
+            echo
+            echo "Everywhere else:"
+            echo
+            echo '```'
+            echo "uvx --from \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz\" ibkr-risk-mcp"
+            echo '```'
+            echo
+            echo "## Changes"
+            echo
+            if [ -n "$previous" ] && [ "$previous" != "$TAG" ]; then
+              git log --no-merges --pretty='- %s' "${previous}..${TAG}"
+            else
+              git log --no-merges --pretty='- %s' "$TAG"
+            fi
+          } > notes.md
+          gh release create "$TAG" dist/* bundle/* --title "$TAG" --notes-file notes.md
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies this workflow's OIDC identity, so no
+    # API token is stored anywhere. It needs a one-time publisher configured on
+    # PyPI first, so the step stays off until the repository variable
+    # PUBLISH_TO_PYPI is set to 'true' — otherwise every release would fail on
+    # a step that cannot yet succeed.
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

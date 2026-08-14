@@ -1,0 +1,18 @@
+# .env first and deliberately. Everything else here is about bundle size; this
+# one is about not shipping somebody's account code and port configuration
+# inside a file they are about to hand to someone else. The bundle is built
+# from the working tree, so a local .env would otherwise go straight in.
+.env
+.venv/
+.git/
+.github/
+tests/
+docs/
+scripts/
+.pytest_cache/
+__pycache__/
+*.pyc
+dist/
+bundle/
+build/
+*.egg-info/
