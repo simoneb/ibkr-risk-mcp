@@ -1,0 +1,95 @@
+{
+  "manifest_version": "0.4",
+  "name": "ibkr-risk-mcp",
+  "display_name": "IBKR Risk (TWS)",
+  "version": "0.1.0",
+  "description": "Model greeks, IB's volatility surface, what-if margin, and portfolio stress curves from Interactive Brokers.",
+  "long_description": "Fills the gap the official IBKR connector leaves: portfolio risk. Pulls IB's own model greeks and implied volatility surface out of TWS, asks IB's margin engine what a hypothetical structure would cost, and rebuilds the P&L-versus-underlying curve locally so you can ask where the trough sits and where a new option position would move it. TWS or IB Gateway must be running on this machine with the API enabled — the extension talks to its local socket, never to IBKR over the internet. It is read-only: the only tool that touches the order path sends whatIf=True orders that IB evaluates and discards, and it stays inert unless you enable it below.",
+  "author": {
+    "name": "Simone Busoli",
+    "url": "https://github.com/simoneb"
+  },
+  "documentation": "https://github.com/simoneb/ibkr-risk-mcp#readme",
+  "support": "https://github.com/simoneb/ibkr-risk-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/simoneb/ibkr-risk-mcp"
+  },
+  "keywords": ["ibkr", "interactive-brokers", "tws", "risk", "options", "greeks"],
+  "license": "MIT",
+  "server": {
+    "type": "uv",
+    "entry_point": "src/ibkr_risk_mcp/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "python", "-m", "ibkr_risk_mcp.server"],
+      "env": {
+        "IBKR_HOST": "${user_config.host}",
+        "IBKR_PORT": "${user_config.port}",
+        "IBKR_CLIENT_ID": "${user_config.client_id}",
+        "IBKR_ACCOUNT": "${user_config.account}",
+        "IBKR_MARKET_DATA_TYPE": "${user_config.market_data_type}",
+        "IBKR_RISK_FREE_RATE": "${user_config.risk_free_rate}",
+        "IBKR_ENABLE_WHATIF": "${user_config.enable_whatif}"
+      }
+    }
+  },
+  "user_config": {
+    "host": {
+      "type": "string",
+      "title": "TWS host",
+      "description": "Where TWS or IB Gateway is listening. Leave at 127.0.0.1 unless it runs on another machine, in which case that machine's IP must also be in the API's Trusted IPs list.",
+      "default": "127.0.0.1",
+      "required": true
+    },
+    "port": {
+      "type": "number",
+      "title": "API port",
+      "description": "7496 for TWS live, 7497 for TWS paper, 4001 for IB Gateway live, 4002 for Gateway paper. If it is wrong, check_connection reports which of the four is actually answering.",
+      "default": 7496,
+      "required": true
+    },
+    "client_id": {
+      "type": "number",
+      "title": "Client id",
+      "description": "TWS refuses a second connection on an id already in use, so this must differ from every other script pointed at the same TWS. Never 0 — TWS reserves that for orders placed by hand in the GUI.",
+      "default": 17,
+      "required": true
+    },
+    "account": {
+      "type": "string",
+      "title": "Account (optional)",
+      "description": "Only needed on a multi-account login, where IB reports every account at once and adding them together means nothing. Leave empty for a single account.",
+      "default": "",
+      "required": false
+    },
+    "market_data_type": {
+      "type": "number",
+      "title": "Market data type",
+      "description": "1 live, 2 frozen, 3 delayed, 4 delayed-frozen. Use 1 if the account has the market data subscription for what you hold. If it does not, 3 is a real fallback rather than a broken mode: delayed data does carry IB's model greeks, about fifteen minutes late.",
+      "default": 1,
+      "required": true
+    },
+    "risk_free_rate": {
+      "type": "string",
+      "title": "Risk-free rate",
+      "description": "Used to discount and to carry spot to the forward in the local repricing, as a decimal (0.04 is 4%). IB does not publish the rate behind its own model, so this is your input.",
+      "default": "0.04",
+      "required": false
+    },
+    "enable_whatif": {
+      "type": "boolean",
+      "title": "Allow what-if margin checks",
+      "description": "Off by default, and off means the connection to TWS itself is opened read-only. On, whatif_order can ask IB's margin engine what a structure would cost. Those orders carry whatIf=True and are never routed to a market — but this is the only tool that touches the order path at all, so it is a switch rather than an assumption. No tool here can submit a live order either way.",
+      "default": false
+    }
+  },
+  "tools_generated": true,
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  }
+}

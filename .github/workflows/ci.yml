@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    # Windows is where this actually runs — TWS is usually on a desktop — but
+    # nothing in the tested code is platform-specific, and Linux catches
+    # accidental Windows assumptions in code that claims to be portable.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Installing with --system is wrong on both runners: uv's managed
+      # interpreters are marked externally managed and refuse it, and on Windows
+      # it puts pytest outside the PATH the shell searches. --allow-existing
+      # keeps this working whether or not setup-uv provisioned the venv itself.
+      - run: uv venv --allow-existing
+      - run: uv pip install -e ".[dev]"
+      # No TWS on a runner, and the suite is built not to need one: the whole
+      # repricing layer runs off recorded fixtures.
+      - run: uv run pytest -q
+      # The server must at least start and register its tools without a
+      # connection — a broken tool signature would otherwise only surface in a
+      # client.
+      - run: uv run python -c "import asyncio; from ibkr_risk_mcp.server import mcp; print(sorted(t.name for t in asyncio.run(mcp.list_tools())))"

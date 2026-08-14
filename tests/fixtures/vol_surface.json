@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Three tenors of an ES put surface in the shape get_vol_surface returns.",
+    "The term structure is the one from the brief and the reason the surface",
+    "class interpolates in total variance: at the money the front month prints",
+    "around 12% while 139 days out sits near 15%, so a single ATM number read",
+    "off the front and applied to the back understates a long-dated position.",
+    "The strike slope is the ordinary index put skew — lower strikes, higher",
+    "volatility."
+  ],
+  "underlying": { "symbol": "ES", "undPrice": 6412.5 },
+  "rows": [
+    { "yearsToExpiry": 0.0548, "strike": 5600, "impliedVol": 0.205, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.0548, "strike": 5900, "impliedVol": 0.17, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.0548, "strike": 6100, "impliedVol": 0.15, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.0548, "strike": 6300, "impliedVol": 0.13, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.0548, "strike": 6400, "impliedVol": 0.121, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.0548, "strike": 6500, "impliedVol": 0.113, "undPrice": 6412.5 },
+
+    { "yearsToExpiry": 0.1918, "strike": 5600, "impliedVol": 0.21, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.1918, "strike": 5900, "impliedVol": 0.185, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.1918, "strike": 6100, "impliedVol": 0.17, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.1918, "strike": 6300, "impliedVol": 0.15, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.1918, "strike": 6400, "impliedVol": 0.135, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.1918, "strike": 6500, "impliedVol": 0.128, "undPrice": 6412.5 },
+
+    { "yearsToExpiry": 0.3808, "strike": 5600, "impliedVol": 0.225, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.3808, "strike": 5900, "impliedVol": 0.2, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.3808, "strike": 6100, "impliedVol": 0.185, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.3808, "strike": 6300, "impliedVol": 0.168, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.3808, "strike": 6400, "impliedVol": 0.15, "undPrice": 6412.5 },
+    { "yearsToExpiry": 0.3808, "strike": 6500, "impliedVol": 0.142, "undPrice": 6412.5 }
+  ]
+}

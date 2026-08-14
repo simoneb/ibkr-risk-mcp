@@ -1,0 +1,52 @@
+[build-system]
+# 77 or newer for PEP 639 licence metadata (the `license` SPDX expression and
+# `license-files`), which older setuptools ignores or rejects.
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ibkr-risk-mcp"
+version = "0.1.0"
+description = "MCP server exposing Interactive Brokers portfolio risk: model greeks, IB's volatility surface, what-if margin, and a local stress engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Simone Busoli" }
+]
+keywords = ["mcp", "ibkr", "interactive-brokers", "tws", "risk", "options", "greeks", "stress-test"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+  "mcp>=1.6.0,<2.0",
+  "ib-async>=1.0.3,<3.0",
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9.0", "pytest-asyncio>=0.23,<2.0"]
+
+[project.scripts]
+ibkr-risk-mcp = "ibkr_risk_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
