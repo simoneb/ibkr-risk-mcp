@@ -570,9 +570,48 @@ async def load_holdings(with_greeks: bool = True, symbol: str | None = None) -> 
         for holding, row in zip(options, rows):
             holding.greeks = row.greeks
             holding.greeks_error = row.error
-        await _backfill_underlying_price(options)
-        await _imply_missing_greeks(options)
+        portfolio_prices = underlying_prices_from_portfolio(holdings)
+        await _backfill_underlying_price(options, portfolio_prices)
+        await _imply_missing_greeks(options, portfolio_prices)
     return holdings
+
+
+def underlying_prices_from_portfolio(holdings: Sequence["Holding"]) -> dict[int, float]:
+    """Prices for anything the account already holds, keyed by conId.
+
+    Every position IB reports carries its own mark on the portfolio update, and
+    that arrives over the **account** channel, which no market data entitlement
+    gates. So a book holding GOOGL stock next to a GOOGL option already knows
+    what GOOGL is worth, and asking again over ``reqMktData`` is both slower and,
+    on an account without the API subscription, refused outright — error 10089
+    on the very underlying whose price is sitting in the snapshot.
+
+    Measured on a live account: two long put positions were being held flat
+    across every shock, worth 2,826 at a 15% fall and 4,414 at 20%, purely
+    because the spot needed to imply their volatility was fetched instead of
+    read. This is the difference between pricing them and dropping them.
+
+    A futures option gets the same benefit when the account also holds the
+    future, since ``underConId`` points straight at it.
+    """
+    prices: dict[int, float] = {}
+    for holding in holdings:
+        conid = getattr(holding.contract, "conId", None)
+        if not conid or holding.is_option:
+            continue
+        price = holding.market_price
+        if price is None and holding.market_value and holding.position:
+            denominator = holding.position * holding.multiplier
+            price = holding.market_value / denominator if denominator else None
+        if price and price > 0:
+            prices[int(conid)] = float(price)
+    return prices
+
+
+#: Set to False the first time ``reqCalcImpliedVolatility`` misbehaves. On the
+#: TWS build measured here it answers with error 320 and drops the connection,
+#: so one failure is one failure too many to repeat.
+_ib_implied_vol_usable = True
 
 
 async def _ib_implied_vol(
@@ -588,7 +627,17 @@ async def _ib_implied_vol(
 
     Returns None on anything unexpected. This is already the fallback path; it
     is not worth failing a portfolio over.
+
+    Gated behind ``IBKR_USE_IB_IMPLIED_VOL`` and off by default: on the TWS
+    build measured here the request comes back as error 320 and TWS closes the
+    connection, which loses the whole portfolio load rather than one option's
+    greeks. After the first failure it is not tried again for the rest of the
+    process, so a book with twenty unpriced strikes cannot pay that cost twenty
+    times over.
     """
+    global _ib_implied_vol_usable
+    if not settings.use_ib_implied_vol or not _ib_implied_vol_usable:
+        return None
     try:
         ib = await connection.get()
         computation = await asyncio.wait_for(
@@ -596,7 +645,13 @@ async def _ib_implied_vol(
             timeout=timeout,
         )
     except Exception as exc:
-        log.debug("calculateImpliedVolatility failed for %s: %s", contract.localSymbol, exc)
+        _ib_implied_vol_usable = False
+        log.warning(
+            "calculateImpliedVolatility failed for %s (%s). Not attempting it again this "
+            "session; volatilities will be implied locally instead.",
+            contract.localSymbol,
+            exc,
+        )
         return None
     # ib_async returns an OptionComputation here, except when it returns a list
     # of them — seen live. Take the first either way rather than trusting the
@@ -619,7 +674,9 @@ async def _ib_implied_vol(
     }
 
 
-async def _imply_missing_greeks(options: Sequence[Holding]) -> None:
+async def _imply_missing_greeks(
+    options: Sequence[Holding], portfolio_prices: dict[int, float] | None = None
+) -> None:
     """Last resort for an option IB priced but would not model.
 
     IB declines to publish model greeks for plenty of ordinary contracts — an
@@ -652,11 +709,16 @@ async def _imply_missing_greeks(options: Sequence[Holding]) -> None:
     if not needy:
         return
 
+    # IB's own forward first, then anything the account holds outright. Both
+    # beat a fresh quote: the first is the number IB's model actually used, the
+    # second cannot be refused for want of an entitlement.
     known_underlying: dict[int, float] = {}
     for holding in options:
         price = (holding.greeks or {}).get("undPrice")
         if holding.und_conid and price:
             known_underlying.setdefault(holding.und_conid, float(price))
+    for conid, price in (portfolio_prices or {}).items():
+        known_underlying.setdefault(conid, price)
 
     rate = settings.risk_free_rate
     for holding in needy:
@@ -680,6 +742,8 @@ async def _imply_missing_greeks(options: Sequence[Holding]) -> None:
         if from_ib is not None:
             holding.greeks = from_ib
             continue
+        # Falling through to the local model is the ordinary case, not an
+        # error: the IB path is opt-in and off by default.
 
         years = C.years_to_expiry(contract)
         is_forward = contract.secType == "FOP"
@@ -709,7 +773,9 @@ async def _imply_missing_greeks(options: Sequence[Holding]) -> None:
         }
 
 
-async def _backfill_underlying_price(options: Sequence[Holding]) -> None:
+async def _backfill_underlying_price(
+    options: Sequence[Holding], portfolio_prices: dict[int, float] | None = None
+) -> None:
     """Give a forward to any option whose greeks arrived without one.
 
     Waiting for ``undPrice`` handles almost every case, but a contract that
@@ -735,10 +801,12 @@ async def _backfill_underlying_price(options: Sequence[Holding]) -> None:
         price = (holding.greeks or {}).get("undPrice")
         if holding.und_conid and price:
             known.setdefault(holding.und_conid, float(price))
+    for conid, price in (portfolio_prices or {}).items():
+        known.setdefault(conid, price)
 
     for conid, group in by_underlying.items():
         price = known.get(conid)
-        source = "another position on the same underlying"
+        source = "a position the account already holds on this underlying"
         if price is None:
             detail = await details_for_conid(conid)
             if detail is None:

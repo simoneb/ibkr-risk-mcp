@@ -275,6 +275,68 @@ def asset_class(sec_type: str) -> str:
     }.get(sec_type, "other")
 
 
+#: The three-letter ISO codes IB uses as the ``symbol`` of a currency future
+#: and its options. IB names the *currency*, not the exchange ticker: the 6E is
+#: ``symbol="EUR"`` and the 6C is ``symbol="CAD"``, so a currency code on a FUT
+#: or FOP is a reliable tell that the underlying is an exchange rate.
+CURRENCY_SYMBOLS = frozenset(
+    """AUD BRL CAD CHF CNH CZK DKK EUR GBP HKD HUF ILS INR JPY KRW MXN NOK NZD
+    PLN RUB SEK SGD TRY USD ZAR""".split()
+)
+
+#: Futures roots by the factor they track, for the roots a book like this
+#: actually holds. Everything not listed falls through to equity, which is the
+#: right default for an index future and the wrong one for anything exotic —
+#: hence :func:`risk_group` being reported rather than assumed.
+_FUTURE_GROUPS: dict[str, str] = {
+    root: group
+    for group, roots in {
+        "rates": "ZT ZF ZN TN ZB UB GE ZQ SR1 SR3 FGBS FGBM FGBL FGBX",
+        "metals": "GC MGC SI SIL HG PA PL",
+        "energy": "CL MCL NG RB HO BZ QM QG",
+    }.items()
+    for root in roots.split()
+}
+
+
+def risk_group(contract: Any) -> str:
+    """Which risk factor a position responds to — as opposed to what kind of
+    instrument it is.
+
+    :func:`asset_class` answers "is this an option". This answers "is this an
+    equity". The two are orthogonal, and conflating them is what puts a CAD
+    strangle and an ES ratio spread in one bucket called ``option`` and then
+    shocks both by the same equity percentage. Measured on a live account, that
+    one CAD strangle contributed −21,716 at a 20% fall *and* −7,183 at a 10%
+    rise, against −29,027 and +2,408 for an entire ES campaign: it dominated
+    both tails of a curve that was supposed to be about equities.
+
+    TWS Risk Navigator draws the same line — its Equity tab excludes FX and
+    fixed income — which is why its curve and this one only agree once the
+    non-equity legs are stood down.
+
+    **This is a table and one heuristic, not a deduction.** IB publishes no
+    reliable asset class for futures, and a bond or gold ETF quoted as ``STK``
+    lands in ``equity`` with no API field to say otherwise. So the group is
+    reported in every result that uses it, and can be overridden per symbol.
+    """
+    sec_type = getattr(contract, "secType", "") or ""
+    symbol = (getattr(contract, "symbol", "") or "").upper()
+    if sec_type == "CASH":
+        return "fx"
+    if sec_type in ("BOND", "BILL"):
+        return "rates"
+    if sec_type in ("FUT", "FOP"):
+        if symbol in CURRENCY_SYMBOLS:
+            return "fx"
+        return _FUTURE_GROUPS.get(symbol, "equity")
+    if sec_type in ("STK", "OPT", "FUND", "ETF", "IND"):
+        return "equity"
+    if sec_type == "CMDTY":
+        return "metals"
+    return "other"
+
+
 def contract_multiplier(contract: Any, default: float = 1.0) -> float:
     """The contract multiplier as a number, read from the contract and never
     assumed. ES is 50 and MES is 5; hardcoding either is how a micro position
@@ -301,6 +363,7 @@ def describe(contract: Any) -> dict[str, Any]:
         "currency": getattr(contract, "currency", None),
         "tradingClass": getattr(contract, "tradingClass", None) or None,
         "multiplier": contract_multiplier(contract),
+        "riskGroup": risk_group(contract),
     }
     if is_option(out["secType"] or ""):
         out["right"] = getattr(contract, "right", None) or None

@@ -12,7 +12,7 @@ import pytest
 from ibkr_risk_mcp import stress as S
 from ibkr_risk_mcp import pricing
 
-from .conftest import FakeAccountValue
+from .conftest import FakeAccountValue, FakeContract
 
 #: Pinned so the fixture's time to expiry — and therefore every price derived
 #: from it — is the same today as it will be next year.
@@ -148,7 +148,7 @@ class TestCurve:
         row = next(r for r in result["curve"] if r["shock"] == -0.10)
         assert row["pnl_by_symbol"]["AAPL"] == pytest.approx(122150.0 * -0.10, rel=1e-9)
 
-    def test_beta_scales_only_the_equity_leg(self, units, shocks):
+    def test_a_beta_on_one_symbol_leaves_the_others_alone(self, units, shocks):
         plain, _ = curve(units, shocks)
         levered, _ = curve(units, shocks, betas={"AAPL": 2.0})
         at = -0.10
@@ -174,6 +174,269 @@ class TestCurve:
         assert row["pnl_by_asset_class"]["bond"] == pytest.approx(
             -6.0 * 0.01 * 48925.0, rel=1e-9
         )
+
+
+@pytest.fixture
+def fx_unit():
+    """A short CAD futures option: the position that made the case for the
+    scope gate. On the live account it contributed -21,716 at a 20% fall and
+    -7,183 at a 10% rise, against -29,027 and +2,408 for an entire ES campaign.
+    """
+    from ibkr_risk_mcp import contracts as C
+    from ibkr_risk_mcp.marketdata import Holding
+
+    contract = FakeContract(
+        conId=900000001,
+        symbol="CAD",
+        localSymbol="CAUZ6 P6900",
+        secType="FOP",
+        right="P",
+        strike=0.69,
+        lastTradeDateOrContractMonth="20261204",
+        tradingClass="CAU",
+        multiplier="100000",
+        exchange="CME",
+        currency="USD",
+    )
+    holding = Holding(
+        contract=contract,
+        position=-2.0,
+        market_price=0.00044,
+        market_value=-88.0,
+        average_cost=0.0,
+        unrealized_pnl=0.0,
+        asset_class=C.asset_class("FOP"),
+        multiplier=C.contract_multiplier(contract),
+        greeks={
+            "impliedVol": 0.057,
+            "delta": -0.05,
+            "gamma": 1.0,
+            "vega": 0.01,
+            "theta": -0.001,
+            "optPrice": 0.00044,
+            "pvDividend": 0.0,
+            "undPrice": 0.7235,
+        },
+    )
+    return S.unit_from_holding(holding, ASOF)
+
+
+class TestScope:
+    """Only equity underlyings are on the axis by default. This is not a
+    refinement of the model, it is what makes the number mean anything."""
+
+    def test_the_unit_knows_its_own_risk_group(self, fx_unit, units):
+        assert fx_unit.risk_group == "fx"
+        assert all(u.risk_group in ("equity", "rates") for u in units)
+
+    def test_an_fx_position_is_off_the_axis_by_default(self, fx_unit, shocks):
+        result, _ = curve([fx_unit], shocks)
+        assert all(r["pnl_total"] == 0.0 for r in result["curve"])
+
+    def test_scope_all_puts_it_back(self, fx_unit, shocks):
+        result, _ = curve([fx_unit], shocks, scope="all")
+        assert any(r["pnl_total"] != 0.0 for r in result["curve"])
+        at_crash = next(r for r in result["curve"] if r["shock"] == -0.30)
+        assert at_crash["pnl_total"] < 0  # short the put, and it goes deep in
+
+    def test_exclusion_is_total_where_a_zero_beta_would_leak(self, fx_unit, shocks):
+        """The difference that matters. A beta of 0 scales the underlying's move
+        and nothing else, so vega and theta still get through; an excluded
+        position must contribute exactly nothing whatever else is switched on.
+        """
+        excluded, _ = curve([fx_unit], shocks, vol_bump=0.05, date_offset_days=30)
+        assert all(r["pnl_total"] == 0.0 for r in excluded["curve"])
+
+        leaked, _ = curve(
+            [fx_unit], shocks, scope="all", betas={"CAD": 0.0},
+            vol_bump=0.05, date_offset_days=30,
+        )
+        at_zero = next(r for r in leaked["curve"] if r["shock"] == 0.0)
+        assert at_zero["pnl_total"] != 0.0
+
+    def test_what_was_excluded_is_named_and_valued(self, fx_unit, units):
+        cfg = S.StressConfig(shocks=[0.0])
+        report = S.excluded_report(units + [fx_unit], cfg)
+        by_group = {r["riskGroup"]: r for r in report}
+        assert by_group["fx"]["symbols"] == ["CAD"]
+        assert by_group["fx"]["marketValue"] == pytest.approx(-88.0)
+        assert "rates" in by_group  # the fixture's bond
+
+    def test_the_exclusion_is_warned_about(self, fx_unit, units):
+        cfg = S.StressConfig(shocks=[0.0])
+        text = " ".join(S.scope_warnings(units + [fx_unit], cfg))
+        assert "CAD" in text and "scope='all'" in text
+
+    def test_a_risk_group_override_moves_a_symbol_off_the_axis(self, units, shocks):
+        """IB publishes no asset class for a bond or gold ETF quoted as a stock,
+        so AAPL-as-equity is a guess like any other and has to be correctable."""
+        plain, _ = curve(units, shocks)
+        overridden, _ = curve(units, shocks, risk_groups={"AAPL": "rates"})
+        at = -0.10
+        assert next(r for r in plain["curve"] if r["shock"] == at)["pnl_by_symbol"]["AAPL"] != 0
+        assert (
+            next(r for r in overridden["curve"] if r["shock"] == at)["pnl_by_symbol"]["AAPL"]
+            == 0.0
+        )
+
+    def test_a_bond_rate_shift_still_works_under_the_equity_scope(self, units, shocks):
+        """A rate shift is a different axis, asked for by name. The equity scope
+        takes bonds off the *shock* axis; silently ignoring the rate shift too
+        would be a surprise, not a simplification."""
+        shifted, _ = curve(units, shocks, bond_rate_shift_bp=100.0, bond_duration_years=6.0)
+        row = next(r for r in shifted["curve"] if r["shock"] == 0.0)
+        assert row["pnl_by_asset_class"]["bond"] == pytest.approx(
+            -6.0 * 0.01 * 48925.0, rel=1e-9
+        )
+
+
+class TestBeta:
+    """The beta scales the *shock*, not the P&L, and it reaches every class
+    that responds to one."""
+
+    def test_it_scales_the_shock_on_an_option_rather_than_its_pnl(self, units, shocks):
+        """The precise statement: an option at beta 0.5 under a 20% shock must
+        price identically to the same option at beta 1.0 under a 10% shock.
+
+        Scaling the P&L instead would price it at the full move and then halve
+        the answer, and for anything convex those are different numbers. This
+        is the test that tells the two apart.
+        """
+        halved, _ = curve(units, shocks, betas={"ES": 0.5})
+        full, _ = curve(units, shocks)
+        at_double = next(r for r in halved["curve"] if r["shock"] == -0.20)
+        at_single = next(r for r in full["curve"] if r["shock"] == -0.10)
+        assert at_double["pnl_by_symbol"]["ES"] == pytest.approx(
+            at_single["pnl_by_symbol"]["ES"]
+        )
+
+    def test_a_zero_beta_takes_a_symbol_off_the_curve(self, units, shocks):
+        """Which is the point of widening the scope: an underlying that does not
+        belong on this axis can be stood down, instead of being shocked by a
+        percentage that means nothing for it."""
+        standing_down, _ = curve(units, shocks, betas={"ES": 0.0})
+        assert all(
+            r["pnl_by_symbol"]["ES"] == pytest.approx(0.0, abs=1e-6)
+            for r in standing_down["curve"]
+        )
+
+    def test_a_zero_beta_is_not_the_same_as_excluding_the_symbol(self, units, shocks):
+        """A beta only scales the underlying's move. It does not touch vega or
+        theta, so a stood-down position still contributes P&L the moment
+        volatility or the valuation date moves — which is exactly when a reader
+        would assume it had been removed. Subtracting `pnl_by_symbol` is the
+        only clean exclusion.
+        """
+        bumped, _ = curve(units, shocks, betas={"ES": 0.0}, vol_bump=0.05)
+        at_zero = next(r for r in bumped["curve"] if r["shock"] == 0.0)
+        assert abs(at_zero["pnl_by_symbol"]["ES"]) > 1.0
+
+    def test_it_reaches_the_futures_leg_too(self, units, shocks):
+        halved, _ = curve(units, shocks, betas={"ES": 0.5})
+        row = next(r for r in halved["curve"] if r["shock"] == 0.05)
+        # The curve rounds to the cent, and half the notional lands on a
+        # half-cent, so this is an absolute tolerance rather than a relative one.
+        assert row["pnl_by_asset_class"]["future"] == pytest.approx(
+            50 * 6412.5 * 0.05 * 0.5, abs=0.01
+        )
+
+    def test_the_most_specific_key_wins(self, units):
+        """Root, local symbol and underlying are all valid keys, for a book
+        holding two contracts on one root that have to be told apart."""
+        cfg = S.StressConfig(
+            shocks=[0.0], betas={"ES": 0.5, "ESZ6 P5800": 0.25, "ESZ6": 0.75}
+        )
+        quarterly = next(u for u in units if u.label == "ESZ6 P5800")
+        weekly = next(u for u in units if u.label == "EW4Z6 P5500")
+        weekly.und_symbol = "ESZ6"
+
+        assert S._beta(quarterly, cfg) == 0.25  # label beats root
+        assert S._beta(weekly, cfg) == 0.5  # root beats underlying
+        weekly.symbol = "6E"
+        assert S._beta(weekly, cfg) == 0.75  # underlying, when the root misses
+        assert S._beta(next(u for u in units if u.symbol == "AAPL"), cfg) == 1.0
+
+
+class TestVolResponse:
+    """The volatility *level* moving with the shock — the term neither vol mode
+    carries and `vol_bump` cannot express, being flat along the axis."""
+
+    def test_the_slope_is_volatility_points_per_one_percent_move(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_slope_down=1.0)
+        opt = next(u for u in units if u.asset_class == "option")
+        assert S.shocked_vol(opt, -0.20, cfg, {}) == pytest.approx(opt.iv + 0.20)
+
+    def test_it_is_asymmetric_by_construction(self, units):
+        """One slope per direction, because an index gives up far more
+        volatility on the way down than it recovers on the way up. A downside
+        slope must do nothing at all to a rally."""
+        opt = next(u for u in units if u.asset_class == "option")
+        down_only = S.StressConfig(shocks=[0.0], vol_slope_down=1.0)
+        up_only = S.StressConfig(shocks=[0.0], vol_slope_up=0.5)
+        assert S.shocked_vol(opt, 0.10, down_only, {}) == pytest.approx(opt.iv)
+        assert S.shocked_vol(opt, 0.10, up_only, {}) == pytest.approx(opt.iv - 0.05)
+        assert S.shocked_vol(opt, -0.10, up_only, {}) == pytest.approx(opt.iv)
+
+    def test_it_stacks_on_the_vol_bump_rather_than_replacing_it(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_bump=0.05, vol_slope_down=1.0)
+        opt = next(u for u in units if u.asset_class == "option")
+        assert S.shocked_vol(opt, -0.10, cfg, {}) == pytest.approx(opt.iv + 0.05 + 0.10)
+
+    def test_the_curve_still_starts_at_exactly_zero(self, units, shocks):
+        """The response is proportional to the shock, so it vanishes at zero and
+        cannot put a step at the origin — unlike vol_bump, which is a real
+        immediate cost and does."""
+        sloped, _ = curve(units, shocks, vol_slope_down=1.5, vol_slope_up=0.5)
+        at_zero = next(r for r in sloped["curve"] if r["shock"] == 0.0)
+        assert at_zero["pnl_total"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_downside_slope_touches_only_the_downside(self, units, shocks):
+        plain, _ = curve(units, shocks)
+        sloped, _ = curve(units, shocks, vol_slope_down=1.0)
+        for a, b in zip(plain["curve"], sloped["curve"]):
+            if a["shock"] > 0:
+                assert a["pnl_total"] == pytest.approx(b["pnl_total"])
+            elif a["shock"] < 0:
+                assert abs(a["pnl_total"] - b["pnl_total"]) > 1.0
+
+    def test_a_short_option_pays_for_the_volatility_it_is_short(self, units):
+        """Taken on one position rather than the portfolio, because the sign is
+        only unambiguous where the vega is: the fixture's net vega changes sign
+        along the curve, so asserting the total would assert the wrong thing.
+        """
+        short_put = next(u for u in units if u.label == "ESZ6 P5800")
+        assert short_put.position < 0
+        plain = S.StressConfig(shocks=[-0.10], rate=RATE, asof=ASOF)
+        sloped = S.StressConfig(shocks=[-0.10], rate=RATE, asof=ASOF, vol_slope_down=1.0)
+        assert S.unit_pnl(short_put, -0.10, sloped, {}) < S.unit_pnl(
+            short_put, -0.10, plain, {}
+        )
+
+    def test_zero_slopes_reprice_exactly_as_before(self, units, shocks):
+        """The default has to be inert: every curve produced before this
+        parameter existed must still come out to the cent."""
+        default, _ = curve(units, shocks)
+        explicit, _ = curve(units, shocks, vol_slope_down=0.0, vol_slope_up=0.0)
+        assert default["curve"] == explicit["curve"]
+
+
+class TestScopeWarnings:
+    """Both knobs make a result less self-evident, so neither may apply
+    silently."""
+
+    def test_an_attenuated_position_is_named(self, units):
+        cfg = S.StressConfig(shocks=[0.0], betas={"ES": 0.2})
+        text = " ".join(S.scope_warnings(units, cfg))
+        assert "ES" in text and "gap risk" in text
+
+    def test_a_flat_volatility_level_is_flagged_on_an_option_book(self, units):
+        cfg = S.StressConfig(shocks=[0.0])
+        assert any("vol_slope_down" in w for w in S.scope_warnings(units, cfg))
+
+    def test_a_slope_that_is_set_states_what_bounds_it(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_slope_down=1.0)
+        text = " ".join(S.scope_warnings(units, cfg))
+        assert "parallel" in text and "tenor" in text
 
 
 class TestVolModes:
@@ -230,6 +493,17 @@ class TestValidation:
         a question nobody asked."""
         with pytest.raises(ValueError, match="fractions"):
             S.StressConfig(shocks=[-10.0, 0.0, 10.0]).validate()
+
+    def test_vol_slopes_in_the_wrong_units_are_caught(self):
+        """1.0 is one volatility point per 1%. Someone reading it as percent or
+        basis points would pass 100 and get hundreds of points on a moderate
+        shock, which prices as a plausible-looking catastrophe."""
+        with pytest.raises(ValueError, match="volatility points"):
+            S.StressConfig(shocks=[0.0], vol_slope_down=100.0).validate()
+
+    def test_an_unknown_scope_is_rejected(self):
+        with pytest.raises(ValueError, match="scope"):
+            S.StressConfig(shocks=[0.0], scope="equities").validate()
 
     def test_an_empty_shock_list_is_rejected(self):
         with pytest.raises(ValueError):

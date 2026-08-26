@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 
 VOL_MODES = ("sticky_strike", "sticky_moneyness")
 
+SCOPES = ("equity", "all")
+
 #: How far the reconciliation may miss NetLiquidation before the result is
 #: flagged. One percent is the prompt's threshold and a fair one: below it the
 #: gap is quote staleness, above it something structural is wrong.
@@ -55,9 +57,54 @@ class StressConfig:
     shocks: Sequence[float]
     vol_mode: str = "sticky_strike"
     vol_bump: float = 0.0
+    #: How the volatility *level* responds to the shock, in volatility points
+    #: per 1% move of the underlying.
+    #:
+    #: This is the term both vol modes leave out. ``vol_bump`` is flat along the
+    #: shock axis, and ``sticky_moneyness`` slides a strike along the *existing*
+    #: smile without ever raising it. A real index does neither: a 20% fall
+    #: takes at-the-money volatility with it, and a book that is net short
+    #: options pays for that move on top of everything the curve already counts.
+    #: With both slopes at zero — the default, and what every earlier result
+    #: assumed — that P&L is silently set to nothing.
+    #:
+    #: ``vol_slope_down=1.0`` adds one volatility point per 1% fall, so a −20%
+    #: shock reprices at +20 points. The two directions are separate parameters
+    #: rather than one signed slope because the effect is not symmetric:
+    #: volatility rises far harder on the way down than it gives back on the way
+    #: up.
+    #:
+    #: Like ``bond_duration_years``, this is an input rather than a measurement,
+    #: and the curve is only as good as the number handed to it.
+    vol_slope_down: float = 0.0
+    #: Volatility points *removed* per 1% rise. Positive means volatility falls
+    #: as the market rallies, which is the usual direction.
+    vol_slope_up: float = 0.0
     date_offset_days: int = 0
     betas: dict[str, float] = field(default_factory=dict)
     default_beta: float = 1.0
+    #: Which underlyings are on the shock axis at all.
+    #:
+    #: ``equity`` — the default — puts only equity-underlying positions on the
+    #: curve and excludes everything else outright. This is not a refinement,
+    #: it is what makes the number mean anything: the engine's one assumption is
+    #: that every underlying moves by the same percentage, and off the equity
+    #: axis that is nonsense. A −20% shock on a CAD futures option prices
+    #: USD/CAD going from 0.72 to 0.58. TWS Risk Navigator draws the same line
+    #: in its Equity tab, and the two curves agree to within a fraction of a
+    #: percent once it is drawn here too.
+    #:
+    #: ``all`` restores the old behaviour and shocks every underlying alike.
+    #: Excluded positions are always listed, never dropped in silence.
+    #:
+    #: A bond rate shift is a *different* axis that the caller asked for
+    #: explicitly, so ``bond_rate_shift_bp`` keeps working under either scope.
+    scope: str = "equity"
+    #: Per-symbol override of :func:`contracts.risk_group`, e.g.
+    #: ``{"TLT": "rates", "GLD": "metals"}``. IB publishes no asset class for a
+    #: bond or gold ETF quoted as a stock, so those land in ``equity`` unless
+    #: they are named here.
+    risk_groups: dict[str, str] = field(default_factory=dict)
     bond_rate_shift_bp: float = 0.0
     bond_duration_years: float = 5.0
     rate: float = field(default_factory=lambda: settings.risk_free_rate)
@@ -73,6 +120,8 @@ class StressConfig:
     def validate(self) -> None:
         if self.vol_mode not in VOL_MODES:
             raise ValueError(f"vol_mode must be one of {VOL_MODES}, got {self.vol_mode!r}")
+        if self.scope not in SCOPES:
+            raise ValueError(f"scope must be one of {SCOPES}, got {self.scope!r}")
         if not self.shocks:
             raise ValueError("shocks must contain at least one value")
         if max(abs(s) for s in self.shocks) > 1.0:
@@ -80,6 +129,13 @@ class StressConfig:
                 "shocks are fractions, not percents: 0.05 is +5%. A value above 1.0 would "
                 "mean the underlying more than doubling, which is almost certainly a "
                 "misread of the units."
+            )
+        if max(abs(self.vol_slope_down), abs(self.vol_slope_up)) > 10.0:
+            raise ValueError(
+                "vol slopes are volatility points per 1% move: 1.0 means a 20% fall "
+                "reprices at +20 points. A value above 10 would put hundreds of points on "
+                "a moderate shock, which is almost certainly percent or basis points in "
+                "the wrong units."
             )
 
 
@@ -101,6 +157,14 @@ class RiskUnit:
     #: the exposure is rebuilt here from price times multiplier times position.
     notional: float | None = None
     sec_type: str = ""
+    #: Which risk factor this position responds to, from the underlying rather
+    #: than the secType. ``asset_class`` says "option"; this says "fx".
+    risk_group: str = "equity"
+    #: The underlying instrument's own symbol — the future an option is written
+    #: on, rather than the option's root. Carried so a beta can be keyed on it:
+    #: ``{"ESZ6": 1.0}`` picks out one quarterly where ``{"ES": 1.0}`` takes
+    #: every contract on the root.
+    und_symbol: str | None = None
     strike: float | None = None
     right: str | None = None
     years: float | None = None
@@ -157,6 +221,8 @@ def unit_from_holding(h: MD.Holding, asof: date | None = None) -> RiskUnit:
         multiplier=h.multiplier,
         market_value=h.market_value,
         sec_type=contract.secType,
+        und_symbol=h.und_symbol,
+        risk_group=C.risk_group(contract),
     )
     if h.asset_class == "future":
         if h.market_price is not None:
@@ -225,6 +291,7 @@ async def units_from_legs(
             multiplier=multiplier,
             market_value=None,
             sec_type=contract.secType,
+            risk_group=C.risk_group(contract),
             hypothetical=True,
         )
         if klass == "option":
@@ -351,13 +418,49 @@ def shocked_vol(
     picks up the volatility that currently belongs to its new moneyness. The
     lookup is done on the *unshocked* smile at ``ln(K/F')``, which is what makes
     it a lookup rather than a refit.
+
+    Neither mode moves the *level* of the surface: one pins volatility to the
+    strike, the other reads it off the smile the portfolio has today. The
+    level's own response to the shock is :func:`vol_response`, and it is added
+    on top of whichever mode is in use — the two answer different questions and
+    do not overlap.
+
+    ``shock`` here is the move of *this* position's underlying, already scaled
+    by its beta, so a position attenuated on the shock axis gets an attenuated
+    volatility response to match.
     """
     base = float(unit.iv or 0.0)
     if cfg.vol_mode == "sticky_moneyness" and unit.skew_key in skews:
         skew = skews[unit.skew_key]
         new_forward = unit.forward(shock, unit.years or 0.0, cfg.rate)
         base = skew.at_strike(float(unit.strike), forward=new_forward)
-    return max(base + cfg.vol_bump, pricing.MIN_VOL)
+    return max(base + cfg.vol_bump + vol_response(shock, cfg), pricing.MIN_VOL)
+
+
+def vol_response(shock: float, cfg: StressConfig) -> float:
+    """Volatility points the shock itself adds, as a fraction of 1.
+
+    The slopes are quoted per 1% move and the shock is a fraction, so the two
+    conversions cancel: a slope of 1.0 against a −0.20 shock is +0.20, twenty
+    volatility points. Zero on both sides leaves the level where the vol mode
+    put it, which is what every result before this parameter existed assumed.
+
+    **This is a parallel shift, and on a wing-heavy book that is the wrong
+    shape.** A real surface steepens in a sell-off: the far out-of-the-money
+    puts pick up much more volatility than the money does. Measured on a live
+    1-2-1 ratio spread book, net short vega at the money, the difference is not
+    subtle — a parallel rise costs money at every shock and the curve only ever
+    gets worse, whereas letting the wings take more eventually turns it back up
+    below the trough. A steepening term was tried and removed: the values that
+    reproduced the shape priced the long wings above 100% implied volatility,
+    which is curve fitting rather than modelling. So this stays parallel, stays
+    an input rather than a measurement, and says so in `warnings`.
+    """
+    if shock < 0:
+        level = cfg.vol_slope_down * (-shock)
+    else:
+        level = -cfg.vol_slope_up * shock
+    return level
 
 
 # --------------------------------------------------------------------------
@@ -365,8 +468,30 @@ def shocked_vol(
 # --------------------------------------------------------------------------
 
 
+def unit_risk_group(unit: RiskUnit, cfg: StressConfig) -> str:
+    """The unit's risk group, after any per-symbol override."""
+    for key in (unit.label, unit.symbol, unit.und_symbol):
+        if key and key in cfg.risk_groups:
+            return str(cfg.risk_groups[key])
+    return unit.risk_group
+
+
+def in_scope(unit: RiskUnit, cfg: StressConfig) -> bool:
+    return cfg.scope == "all" or unit_risk_group(unit, cfg) == "equity"
+
+
 def _beta(unit: RiskUnit, cfg: StressConfig) -> float:
-    return float(cfg.betas.get(unit.symbol, cfg.betas.get(unit.label, cfg.default_beta)))
+    """How much of the shock this position sees. Most specific key wins.
+
+    ``label`` is the local symbol (``ESZ6 P5800``), ``symbol`` the root
+    (``ES``), ``und_symbol`` the instrument an option is written on (``ESZ6``).
+    The root is what most callers want; the other two are there for a book that
+    holds two contracts on one root and has to tell them apart.
+    """
+    for key in (unit.label, unit.symbol, unit.und_symbol):
+        if key and key in cfg.betas:
+            return float(cfg.betas[key])
+    return float(cfg.default_beta)
 
 
 def unit_pnl(
@@ -375,26 +500,54 @@ def unit_pnl(
     cfg: StressConfig,
     skews: dict[tuple[str, str], pricing.VolSkew],
 ) -> float:
+    """P&L for one position under one shock.
+
+    The beta scales **the shock**, not the P&L. An option is therefore repriced
+    at the move its own underlying actually makes, with strike, smile and
+    convexity all measured at the forward it would reach; scaling the P&L
+    instead would price it at the index move and then shrink the answer, which
+    for anything convex is a different number and a wrong one.
+
+    This widens the scope of ``betas``, which used to reach equity alone on the
+    grounds that an option should move with its own underlying. It still does —
+    but only when that underlying is the one being shocked. A short EUR strangle
+    in an S&P scenario is not a 20%-down position, and with the beta confined to
+    equity there was no way to say so. ``default_beta`` is 1.0, so a run that
+    passes no betas prices exactly as it did before.
+    """
+    # A rate shift is a separate axis the caller asked for by name, so it is
+    # answered before the equity scope has any say — a bond is off the equity
+    # curve either way, but silently ignoring bond_rate_shift_bp because of it
+    # would be a different and surprising thing.
+    if unit.asset_class == "bond":
+        if not cfg.bond_rate_shift_bp:
+            return 0.0
+        dy = cfg.bond_rate_shift_bp / 10_000.0
+        return -cfg.bond_duration_years * dy * float(unit.market_value or 0.0)
+
+    # Off the axis entirely, not attenuated to zero: a beta of 0 would still let
+    # vega and theta through, and an excluded position must contribute nothing
+    # at all. What it does contribute in its own scenario is not modelled here,
+    # which is what the warning says.
+    if not in_scope(unit, cfg):
+        return 0.0
+
+    eff = shock * _beta(unit, cfg)
+
     if unit.asset_class == "option":
         if not unit.priceable:
             return 0.0
         years_now = float(unit.years)
         years_then = max(years_now - cfg.date_offset_days / C.DAYS_PER_YEAR, pricing.MIN_YEARS)
         base = unit.model_price(0.0, float(unit.iv), years_now, cfg.rate)
-        shocked = unit.model_price(shock, shocked_vol(unit, shock, cfg, skews), years_then, cfg.rate)
+        shocked = unit.model_price(eff, shocked_vol(unit, eff, cfg, skews), years_then, cfg.rate)
         return (shocked - base) * unit.position * unit.multiplier
 
     if unit.asset_class == "equity":
-        return float(unit.market_value or 0.0) * shock * _beta(unit, cfg)
+        return float(unit.market_value or 0.0) * eff
 
     if unit.asset_class == "future":
-        return float(unit.notional or 0.0) * shock
-
-    if unit.asset_class == "bond":
-        if not cfg.bond_rate_shift_bp:
-            return 0.0
-        dy = cfg.bond_rate_shift_bp / 10_000.0
-        return -cfg.bond_duration_years * dy * float(unit.market_value or 0.0)
+        return float(unit.notional or 0.0) * eff
 
     return 0.0
 
@@ -565,11 +718,19 @@ def _position_report(units: Sequence[RiskUnit], cfg: StressConfig) -> list[dict[
     believed at all."""
     out = []
     for u in units:
+        beta = _beta(u, cfg)
         row: dict[str, Any] = {
             "key": u.key,
             "label": u.label,
             "symbol": u.symbol,
+            "undSymbol": u.und_symbol,
             "assetClass": u.asset_class,
+            "riskGroup": unit_risk_group(u, cfg),
+            # Only worth a line when it is False; a column of True is noise.
+            "offAxis": True if not in_scope(u, cfg) else None,
+            # Only when it is doing something. A column of 1.0s buries the rows
+            # where a beta actually moved the answer.
+            "beta": beta if beta != 1.0 else None,
             "position": u.position,
             "multiplier": u.multiplier,
             "marketValue": u.market_value,
@@ -598,21 +759,140 @@ def _position_report(units: Sequence[RiskUnit], cfg: StressConfig) -> list[dict[
     return out
 
 
+def excluded_report(units: Sequence[RiskUnit], cfg: StressConfig) -> list[dict[str, Any]]:
+    """Every position the scope took off the axis, with what it is worth.
+
+    Excluding non-equity underlyings is what makes the curve mean something, but
+    it also means the curve is no longer the whole account — and the reader has
+    to be able to see the difference rather than infer it. Grouped by risk
+    factor, because that is the unit in which the missing exposure would have to
+    be modelled.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    for unit in units:
+        if in_scope(unit, cfg):
+            continue
+        group = unit_risk_group(unit, cfg)
+        row = grouped.setdefault(
+            group, {"riskGroup": group, "symbols": set(), "marketValue": 0.0, "positions": 0}
+        )
+        row["symbols"].add(unit.symbol)
+        row["marketValue"] += float(unit.market_value or 0.0)
+        row["positions"] += 1
+    return [
+        {
+            "riskGroup": row["riskGroup"],
+            "symbols": sorted(row["symbols"]),
+            "positions": row["positions"],
+            "marketValue": round(row["marketValue"], 2),
+        }
+        for _, row in sorted(grouped.items())
+    ]
+
+
+def scope_warnings(units: Sequence[RiskUnit], cfg: StressConfig) -> list[str]:
+    """What the beta and the volatility slope did to the curve's meaning.
+
+    Both are improvements that make a result *less* self-evident. A beta below
+    one takes a position most of the way off the axis, and a reader who does not
+    know that will read the trough as covering it. A volatility slope adds a
+    real P&L term from a number nobody measured. Neither should have to be
+    inferred from `assumptions`.
+    """
+    out: list[str] = []
+
+    excluded = excluded_report(units, cfg)
+    if excluded:
+        detail = "; ".join(
+            f"{r['riskGroup']} ({', '.join(r['symbols'])}, {r['marketValue']:,.0f})"
+            for r in excluded
+        )
+        out.append(
+            f"scope={cfg.scope!r} kept only equity underlyings on the axis. Left off "
+            f"entirely: {detail}. This is deliberate — one percentage shock applied to "
+            "every underlying at once is meaningless off the equity axis, and a currency "
+            "future shocked 20% prices an exchange rate move that has never happened — but "
+            "it does mean the curve is no longer the whole account. Those positions carry "
+            "risk that is not anywhere on it. Pass scope='all' to put them back."
+        )
+
+    attenuated = sorted(
+        {
+            u.symbol
+            for u in units
+            if u.asset_class in ("option", "future") and _beta(u, cfg) != 1.0
+        }
+    )
+    if attenuated:
+        out.append(
+            f"Positions on {', '.join(attenuated)} were repriced at a beta-scaled move of "
+            "their own underlying rather than at the full shock. That is what makes this "
+            "curve readable when one underlying does not belong on the axis — but it does "
+            "not *measure* those positions, it stands them down. A short strangle "
+            "attenuated to a fifth of the equity move still carries its whole gap risk, "
+            "and none of that risk is on this curve. Their contribution here is in "
+            "`pnl_by_symbol`; their own scenario is not modelled by this server."
+        )
+
+    if cfg.vol_slope_down or cfg.vol_slope_up:
+        out.append(
+            f"Implied volatility responds to the shock at {cfg.vol_slope_down:g} point(s) "
+            f"per 1% down and {cfg.vol_slope_up:g} per 1% up. That is your input, not a "
+            "measurement, and two things about how it is applied bound it: it is a "
+            "*parallel* shift, while a real surface also steepens in a sell-off — which "
+            "understates a long out-of-the-money put — and it is flat across tenors, while "
+            "a 120-day volatility moves less than the front month, so a slope calibrated "
+            "on the front overstates the move on a long-dated position."
+        )
+    elif any(u.asset_class == "option" and u.priceable for u in units):
+        out.append(
+            "The volatility level is held constant along the shock axis: this curve prices "
+            "the move in the underlying and not the move in volatility that comes with it. "
+            "For a net short option book that is the optimistic half of the answer. Set "
+            "vol_slope_down (1.0 is one volatility point per 1% fall) to put it in."
+        )
+    return out
+
+
 def assumptions(cfg: StressConfig) -> dict[str, Any]:
     return {
         "volMode": cfg.vol_mode,
         "volBump": cfg.vol_bump,
+        "volSlopeDown": cfg.vol_slope_down,
+        "volSlopeUp": cfg.vol_slope_up,
+        "volatilityLevel": (
+            f"responds to the shock at {cfg.vol_slope_down:g} point(s) per 1% down and "
+            f"{cfg.vol_slope_up:g} per 1% up, as a parallel shift of the whole surface"
+            if (cfg.vol_slope_down or cfg.vol_slope_up)
+            else "held constant along the shock axis — the volatility level does not "
+            "respond to the move at all. Set vol_slope_down to price the volatility a "
+            "sell-off brings with it; a net short option book loses money on that term "
+            "and none of it is in this curve."
+        ),
         "dateOffsetDays": cfg.date_offset_days,
         "riskFreeRate": cfg.rate,
+        "scope": cfg.scope,
+        "scopeMeaning": (
+            "only equity underlyings are on the shock axis; FX, rates and anything else is "
+            "excluded outright and listed under `excluded`. This matches what TWS Risk "
+            "Navigator's Equity tab does."
+            if cfg.scope == "equity"
+            else "every underlying is on the shock axis, moved by the same percentage — "
+            "including FX and rates, where that assumption does not hold"
+        ),
+        "riskGroupOverrides": cfg.risk_groups or None,
         "defaultBeta": cfg.default_beta,
         "betas": cfg.betas or None,
+        "betaScope": "the beta scales the shock on every position that responds to one — "
+        "options and futures as well as equities. An option is repriced at its own "
+        "beta-scaled move of its underlying, not at the index move.",
         "bondRateShiftBp": cfg.bond_rate_shift_bp,
         "bondDurationYears": cfg.bond_duration_years if cfg.bond_rate_shift_bp else None,
         "dayCount": "ACT/365 to the settlement date",
         "model": "Black-76 on a shocked forward; equity options carried from spot "
         "using IB's pvDividend",
         "underlyingCorrelation": "all underlyings shocked by the same percentage "
-        "simultaneously (Risk Navigator's default assumption)",
+        "simultaneously (Risk Navigator's default assumption), each scaled by its beta",
     }
 
 
@@ -645,6 +925,7 @@ async def stress_portfolio(cfg: StressConfig) -> dict[str, Any]:
         warnings.append(
             f"Held flat because this server does not model them: {', '.join(sorted(other))}."
         )
+    warnings.extend(scope_warnings(units, cfg))
 
     result = run_curve(units, cfg, skews)
     reconciliation = reconcile(holdings, ib, connection.require_account())
@@ -653,6 +934,7 @@ async def stress_portfolio(cfg: StressConfig) -> dict[str, Any]:
         "reconciliation": reconciliation,
         "reconciled": reconciliation.get("reconciled", False),
         "assumptions": assumptions(cfg),
+        "excluded": excluded_report(units, cfg),
         "positions": _position_report(units, cfg),
         "warnings": warnings,
     }
@@ -680,6 +962,7 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
             "'with legs' curve — see `legProblems`. The comparison below is of the "
             "portfolio against the legs that did resolve."
         )
+    warnings.extend(scope_warnings(combined, cfg))
 
     base = run_curve(base_units, cfg, skews)
     withlegs = run_curve(combined, cfg, skews)
@@ -711,6 +994,7 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
         },
         "legs": _position_report(leg_units, cfg),
         "legProblems": leg_problems,
+        "excluded": excluded_report(combined, cfg),
         "reconciliation": reconciliation,
         "reconciled": reconciliation.get("reconciled", False),
         "assumptions": assumptions(cfg),

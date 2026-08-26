@@ -205,3 +205,52 @@ class TestLeg:
     def test_sell_is_a_negative_quantity(self):
         assert C.Leg(conid=1, action="SELL", quantity=3).signed_quantity == -3
         assert C.Leg(conid=1, action="BUY", quantity=3).signed_quantity == 3
+
+
+class TestRiskGroup:
+    """Which factor a position responds to, as opposed to what instrument it
+    is. `asset_class` cannot answer this: an ES option and a CAD option are both
+    `option`, and shocking both by one equity percentage is how a currency
+    strangle ends up dominating an equity curve."""
+
+    @pytest.mark.parametrize(
+        "sec_type,symbol,expected",
+        [
+            # IB names the currency, not the exchange ticker: the 6C is CAD.
+            ("FUT", "CAD", "fx"),
+            ("FOP", "CAD", "fx"),
+            ("FOP", "EUR", "fx"),
+            ("FUT", "JPY", "fx"),
+            ("CASH", "EURUSD", "fx"),
+            # Index futures and their options are the equity default.
+            ("FUT", "ES", "equity"),
+            ("FOP", "ES", "equity"),
+            ("FOP", "NQ", "equity"),
+            ("STK", "AAPL", "equity"),
+            ("OPT", "GOOGL", "equity"),
+            # Everything else the table knows about.
+            ("FUT", "ZN", "rates"),
+            ("FUT", "UB", "rates"),
+            ("BOND", "US-T", "rates"),
+            ("FUT", "GC", "metals"),
+            ("FUT", "CL", "energy"),
+        ],
+    )
+    def test_groups(self, sec_type, symbol, expected):
+        contract = FakeContract(secType=sec_type, symbol=symbol)
+        assert C.risk_group(contract) == expected
+
+    def test_an_unlisted_futures_root_falls_through_to_equity(self):
+        """Right for an index future, wrong for anything exotic — which is why
+        the group is reported in every result and can be overridden."""
+        assert C.risk_group(FakeContract(secType="FUT", symbol="ZZZ")) == "equity"
+
+    def test_describe_carries_the_group(self):
+        """A misclassification has to be visible. IB publishes no asset class
+        for a bond or gold ETF quoted as a stock, so the only defence is that
+        the guess is printed next to the position."""
+        out = C.describe(FakeContract(
+            secType="FOP", symbol="CAD", localSymbol="CAUZ6 P6900",
+            lastTradeDateOrContractMonth="20261204", tradingClass="CAU",
+        ))
+        assert out["riskGroup"] == "fx"

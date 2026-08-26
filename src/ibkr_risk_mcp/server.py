@@ -315,20 +315,28 @@ def _stress_config(
     shocks: Sequence[float],
     vol_mode: str,
     vol_bump: float,
+    vol_slope_down: float,
+    vol_slope_up: float,
     date_offset_days: int,
     betas: dict[str, float] | None,
     default_beta: float,
     bond_rate_shift_bp: float,
     bond_duration_years: float,
     fetch_skew: bool,
+    scope: str = "equity",
+    risk_groups: dict[str, str] | None = None,
 ) -> S.StressConfig:
     return S.StressConfig(
         shocks=list(shocks),
         vol_mode=vol_mode,
         vol_bump=vol_bump,
+        vol_slope_down=vol_slope_down,
+        vol_slope_up=vol_slope_up,
         date_offset_days=date_offset_days,
         betas=dict(betas or {}),
         default_beta=default_beta,
+        scope=scope,
+        risk_groups=dict(risk_groups or {}),
         bond_rate_shift_bp=bond_rate_shift_bp,
         bond_duration_years=bond_duration_years,
         fetch_skew=fetch_skew,
@@ -348,15 +356,54 @@ async def stress_portfolio(
         "forward.",
     ),
     vol_bump: float = Field(
-        default=0.0, description="Added to every volatility, in points: 0.05 is +5 points."
+        default=0.0,
+        description="Added to every volatility, in points, flat along the shock axis: 0.05 "
+        "is +5 points at every shock. For volatility that responds to the shock itself, "
+        "use vol_slope_down.",
+    ),
+    vol_slope_down: float = Field(
+        default=0.0,
+        description="Volatility points added per 1% FALL in the underlying: 1.0 means a "
+        "-20% shock reprices at +20 points. Zero — the default — holds the volatility "
+        "level flat, which prices the move in the underlying and not the move in "
+        "volatility that comes with it. A net short option book loses real money on that "
+        "term, so leaving this at zero is the optimistic half of the answer.",
+    ),
+    vol_slope_up: float = Field(
+        default=0.0,
+        description="Volatility points removed per 1% RISE. Positive means volatility "
+        "falls as the market rallies, which is the usual direction. Separate from "
+        "vol_slope_down because the response is not symmetric.",
     ),
     date_offset_days: int = Field(
         default=0, description="Roll the valuation date forward this many days (time decay)."
     ),
+    scope: Literal["equity", "all"] = Field(
+        default="equity",
+        description="Which underlyings are on the shock axis. 'equity' — the default — "
+        "keeps only equity underlyings and excludes FX, rates and the rest outright, which "
+        "is what TWS Risk Navigator's Equity tab does and what makes the curve comparable "
+        "to it. Off the equity axis a single percentage shock is meaningless: a currency "
+        "future moved 20% prices an exchange rate that has never traded there. 'all' shocks "
+        "everything alike. Excluded positions are always listed under `excluded`, never "
+        "dropped in silence.",
+    ),
+    risk_groups: dict[str, str] | None = Field(
+        default=None,
+        description="Override the risk group of a symbol, e.g. {'TLT': 'rates', 'GLD': "
+        "'metals'}. IB publishes no asset class for a bond or gold ETF quoted as a stock, "
+        "so those are classified as equity unless named here. Groups: equity, fx, rates, "
+        "metals, energy, other.",
+    ),
     betas: dict[str, float] | None = Field(
         default=None,
-        description="Per-symbol beta for equity positions, e.g. {'AAPL': 1.2}. Options and "
-        "futures always move with their own underlying.",
+        description="Per-symbol share of the shock, e.g. {'AAPL': 1.2, 'EUR': 0.0}. Applies "
+        "to options and futures as well as equities: the beta scales the move of that "
+        "position's own underlying, and the option is then repriced there. Key it on the "
+        "root ('ES'), the local symbol ('ESZ6 P5800') or the underlying ('ESZ6'); the most "
+        "specific match wins. Use it to stand a foreign underlying down off an equity axis "
+        "— but read the warning it produces: a beta of 0 removes a position from this "
+        "curve, it does not measure its own risk.",
     ),
     default_beta: float = 1.0,
     bond_rate_shift_bp: float = Field(
@@ -384,12 +431,32 @@ async def stress_portfolio(
 
     The model, returned with every result in `assumptions`:
 
-    - all underlyings are shocked by the same percentage at once, which is Risk
-      Navigator's own default assumption. Equity positions can be scaled with
-      `betas`; options and futures move one-for-one with their underlying.
+    - **only equity underlyings are on the axis by default** (`scope='equity'`).
+      FX, rates and anything else is excluded outright and listed under
+      `excluded` with its market value. This is what Risk Navigator's Equity tab
+      does, and it is what makes the two comparable — verified against a live
+      account, where the engine and Risk Navigator agreed to 7 dollars on 29,000
+      at a 15% fall once the FX leg was off both. Off the equity axis the single
+      shock is meaningless: the same account's CAD strangle was contributing
+      -21,716 at -20% *and* -7,183 at +10%, dominating both tails.
+    - all underlyings in scope are shocked by the same percentage at once, which
+      is Risk Navigator's own default assumption. `betas` scales that shock per symbol
+      and reaches **every** class that responds to one — an option is repriced
+      at its own beta-scaled move, not at the index move. Use it to stand a
+      foreign underlying down off an equity axis, and read the warning it
+      produces: a beta of 0 takes a position off this curve, it does not
+      measure that position's own risk.
     - options are repriced with Black-76 on the shocked forward using **IB's**
       implied volatility. Equity options are carried from spot using IB's
       pvDividend, so both kinds go through one pricer.
+    - **the volatility level is flat along the shock axis unless you say
+      otherwise.** Neither vol mode raises it: sticky_strike pins volatility to
+      the strike, sticky_moneyness slides a strike along today's smile. Real
+      volatility rises when an index falls, and a net short option book pays for
+      that on top of the delta and gamma this curve already counts. `vol_bump`
+      does not fill the gap — it is constant across shocks. `vol_slope_down`
+      does: 1.0 adds one volatility point per 1% fall. It is your input, not a
+      measurement, and it is applied as a parallel shift across every tenor.
     - P&L is model-price-now against model-price-shocked, so the curve is
       exactly zero at zero shock by construction. The gap between the local
       model and IB's own price is reported per position as `modelVsMarket`
@@ -415,12 +482,16 @@ async def stress_portfolio(
         shocks,
         vol_mode,
         vol_bump,
+        vol_slope_down,
+        vol_slope_up,
         date_offset_days,
         betas,
         default_beta,
         bond_rate_shift_bp,
         bond_duration_years,
         fetch_skew,
+        scope,
+        risk_groups,
     )
     return await S.stress_portfolio(cfg)
 
@@ -434,7 +505,11 @@ async def stress_whatif(
     shocks: list[float] = Field(description="Underlying moves as fractions, as above."),
     vol_mode: Literal["sticky_strike", "sticky_moneyness"] = "sticky_strike",
     vol_bump: float = 0.0,
+    vol_slope_down: float = 0.0,
+    vol_slope_up: float = 0.0,
     date_offset_days: int = 0,
+    scope: Literal["equity", "all"] = "equity",
+    risk_groups: dict[str, str] | None = None,
     betas: dict[str, float] | None = None,
     default_beta: float = 1.0,
     bond_rate_shift_bp: float = 0.0,
@@ -467,12 +542,16 @@ async def stress_whatif(
         shocks,
         vol_mode,
         vol_bump,
+        vol_slope_down,
+        vol_slope_up,
         date_offset_days,
         betas,
         default_beta,
         bond_rate_shift_bp,
         bond_duration_years,
         fetch_skew,
+        scope,
+        risk_groups,
     )
     return await S.stress_whatif(legs, cfg)
 

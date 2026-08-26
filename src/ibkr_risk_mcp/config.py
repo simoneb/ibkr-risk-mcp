@@ -85,6 +85,21 @@ class Settings:
     #: measurement: it moves option values by little over the horizons this
     #: server deals with, but it is not zero either.
     risk_free_rate: float
+    #: Whether to ask IB to imply a volatility for an option it would not
+    #: publish model greeks for, via ``reqCalcImpliedVolatility``.
+    #:
+    #: **Off by default, and the reason is not caution.** Measured against live
+    #: TWS: ib_async's request for this is answered with error 320 — "Error
+    #: reading request. Please use 'Key=Value' format for Misc Options" — and
+    #: TWS then **closes the API connection**. A protocol error mid-way through
+    #: a portfolio load takes the socket down with it, which is a great deal
+    #: worse than the thing it was trying to fix.
+    #:
+    #: When it does work it is the better answer — IB's own American-exercise
+    #: model rather than a European volatility implied locally — so it stays
+    #: available for a TWS build that accepts it. It is not something to have on
+    #: the default path of a read-only risk server.
+    use_ib_implied_vol: bool
     connect_timeout: float
     #: How long to wait for IB to answer a what-if order. It is not always
     #: answered at all — TWS silently drops the request when "Read-Only API" is
@@ -105,6 +120,7 @@ def load_settings() -> Settings:
         greeks_timeout=_float_env("IBKR_GREEKS_TIMEOUT", 4.0),
         max_market_data_lines=_int_env("IBKR_MAX_MKT_DATA_LINES", 40),
         risk_free_rate=_float_env("IBKR_RISK_FREE_RATE", 0.04),
+        use_ib_implied_vol=_bool_env("IBKR_USE_IB_IMPLIED_VOL", False),
         connect_timeout=_float_env("IBKR_CONNECT_TIMEOUT", 6.0),
         whatif_timeout=_float_env("IBKR_WHATIF_TIMEOUT", 5.0),
     )
