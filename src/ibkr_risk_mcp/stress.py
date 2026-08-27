@@ -28,9 +28,10 @@ with ``reconciled: false`` and the residual attached.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ib_async import Contract
 
@@ -50,6 +51,19 @@ SCOPES = ("equity", "all")
 #: flagged. One percent is the prompt's threshold and a fair one: below it the
 #: gap is quote staleness, above it something structural is wrong.
 RECONCILE_TOLERANCE = 0.01
+
+#: Decay of ``VR(t)`` in the vol_coord model. **Fitted, not published.** IB
+#: documents that the term-structure response exists and is decreasing; this
+#: value came from one Risk Navigator screenshot, on one account, from nine
+#: points read off a chart by eye. Every run that uses it says so.
+DEFAULT_VOL_COORD_DECAY = 4.736
+
+#: How far out in tenor :data:`DEFAULT_VOL_COORD_DECAY` was ever constrained.
+#: The book it was fitted on held nothing past four months, so beyond this the
+#: exponential is extrapolation — and it extrapolates to zero, which would
+#: price a long-dated option as carrying no volatility risk at all. Positions
+#: past it are named in `warnings` rather than silently repriced.
+DEFAULT_VOL_COORD_CALIBRATED_YEARS = 0.345
 
 
 @dataclass
@@ -80,6 +94,38 @@ class StressConfig:
     #: Volatility points *removed* per 1% rise. Positive means volatility falls
     #: as the market rallies, which is the usual direction.
     vol_slope_up: float = 0.0
+    #: Use IB's own volatility-coordinated model instead of the additive slopes.
+    #:
+    #: Risk Navigator's second curve — the one it labels ``Vol.Coord.`` — moves
+    #: volatility as a *deterministic function of the price shock*, and IB
+    #: documents its shape: the nominal shock is ``-X`` for a rise and ``-10X``
+    #: for a fall, applied **relatively** rather than in points, then damped
+    #: across tenors by a response function ``VR(t)`` that is 1 at zero and
+    #: decreasing.
+    #:
+    #: Relative is the part the additive slopes cannot imitate. Multiplying
+    #: every volatility by the same factor puts more *points* on a wing already
+    #: quoted at 41% than on a 31% at-the-money, so the surface steepens on its
+    #: own — which is what a real sell-off does and what a parallel shift
+    #: cannot produce at any slope.
+    vol_coord: bool = False
+    #: The relative volatility shock per unit of price fall, ``10`` in IB's
+    #: documented form: a 20% fall triples volatility before damping.
+    vol_coord_down: float = 10.0
+    #: Per unit of price rise, ``1`` in IB's documented form.
+    vol_coord_up: float = 1.0
+    #: Decay of ``VR(t) = exp(-decay * t)``. IB documents that the function
+    #: exists and is decreasing but not what it is, so this is **fitted, not
+    #: published**: it reproduces a live Risk Navigator Vol.Coord. curve to an
+    #: RMS of roughly 3% of that curve's own depth, against four times worse
+    #: for the best two-parameter additive fit. It is one number calibrated on
+    #: one book, and it should be refitted against your own Risk Navigator
+    #: before being trusted on another.
+    vol_coord_decay: float = DEFAULT_VOL_COORD_DECAY
+    #: Tenor beyond which the decay above was never calibrated. Positions past
+    #: it still price, and are named in `warnings` so the extrapolation is not
+    #: silent.
+    vol_coord_calibrated_to_years: float = DEFAULT_VOL_COORD_CALIBRATED_YEARS
     date_offset_days: int = 0
     betas: dict[str, float] = field(default_factory=dict)
     default_beta: float = 1.0
@@ -137,6 +183,64 @@ class StressConfig:
                 "a moderate shock, which is almost certainly percent or basis points in "
                 "the wrong units."
             )
+
+
+@dataclass
+class VolScenario:
+    """One volatility regime on the same portfolio and the same shock axis.
+
+    A scenario changes nothing about the positions or the surface — only how
+    the volatility *level* answers the shock. That is deliberate: the point of
+    running several is to make the vol assumption a visible axis of the result
+    rather than a choice buried in one number, so everything else has to be
+    held identical between them.
+    """
+
+    name: str
+    #: Volatility points added per 1% fall, as in :attr:`StressConfig.vol_slope_down`.
+    #: Zero is the constant-volatility curve.
+    vol_slope_down: float = 0.0
+    #: Volatility points removed per 1% rise. Positive means volatility falls
+    #: into a rally, which is the usual direction.
+    vol_slope_up: float = 0.0
+    #: A flat shift of the whole surface for this regime, in points, applied at
+    #: every shock including zero. Unlike the slopes this moves the P&L at zero
+    #: shock, so a scenario that uses it does not start the curve at zero.
+    vol_bump: float = 0.0
+    #: Use IB's relative, term-damped Vol.Coord. model for this curve instead
+    #: of the additive slopes above. The two do not combine: with this on, the
+    #: slopes are ignored and ``vol_bump`` still applies.
+    vol_coord: bool = False
+
+    def overrides(self) -> dict[str, Any]:
+        return {
+            "vol_slope_down": self.vol_slope_down,
+            "vol_slope_up": self.vol_slope_up,
+            "vol_bump": self.vol_bump,
+            "vol_coord": self.vol_coord,
+        }
+
+
+#: −40% to +10% in 2% steps. Wide enough on the downside that a short-gamma
+#: book's trough falls inside the window rather than on its edge, and short on
+#: the upside because that half of the curve is nearly straight.
+DEFAULT_SHOCKS: tuple[float, ...] = tuple(round(-0.40 + i * 0.02, 4) for i in range(26))
+
+#: The two curves Risk Navigator itself draws, and nothing invented on top.
+#:
+#: ``const`` is the constant-volatility case — its blue line, and the one with
+#: an external check. ``vol_coord`` is IB's own volatility-coordinated model,
+#: its ``Vol.Coord.`` curve, in the documented relative form.
+#:
+#: An earlier default set carried two additive slopes, 0.7 and 1.4 points per
+#: 1% fall. They are gone because they were invented rather than measured, and
+#: because a parallel shift is the wrong *shape*: on a ratio book it made
+#: the curve monotonically worse where Risk Navigator turns it back up. Additive
+#: slopes remain available for a regime you want to state by hand.
+DEFAULT_VOL_SCENARIOS: tuple["VolScenario", ...] = (
+    VolScenario("const"),
+    VolScenario("vol_coord", vol_coord=True),
+)
 
 
 @dataclass
@@ -332,17 +436,25 @@ async def units_from_legs(
 # --------------------------------------------------------------------------
 
 
-async def build_skews(
+async def build_surfaces(
     units: Sequence[RiskUnit], cfg: StressConfig
-) -> tuple[dict[tuple[str, str], pricing.VolSkew], list[str]]:
-    """A smile per (underlying, settlement date), from the portfolio's own
-    implied volatilities where it has enough of them.
+) -> tuple[dict[str, pricing.VolSurface], list[str]]:
+    """One :class:`~ibkr_risk_mcp.pricing.VolSurface` per underlying root, built
+    from the portfolio's own implied volatilities.
 
-    Sticky moneyness needs a slope. Three strikes on the same expiry is the
-    minimum that has one; with fewer, the honest answer is that the portfolio
-    does not pin down the skew, and the engine says so and falls back to sticky
-    strike for that expiry rather than inventing a flat smile and presenting it
-    as the alternative model.
+    A surface rather than a bag of independent smiles, because the two axes fail
+    differently. Along **strike**, three quotes on one expiry are the minimum
+    that has a slope; with fewer, that expiry does not pin down a smile. Along
+    **tenor**, a book routinely holds one lonely strike on a back month and a
+    full ladder on the front — and the back month's *shape* is far better
+    approximated by the front's, carried across in total variance, than by the
+    flat line a single quote implies.
+
+    So an expiry contributes its shape to the surface only when it has three
+    distinct strikes, and every option is then read off the surface at its own
+    tenor, interpolated between the tenors that do. An underlying where no
+    expiry defines a smile gets no surface at all and is repriced sticky_strike,
+    which is said out loud rather than papered over with a flat smile.
     """
     warnings: list[str] = []
     if cfg.vol_mode != "sticky_moneyness":
@@ -353,27 +465,44 @@ async def build_skews(
         if u.asset_class == "option" and u.priceable and u.skew_key:
             grouped.setdefault(u.skew_key, []).append(u)
 
-    skews: dict[tuple[str, str], pricing.VolSkew] = {}
-    for key, group in grouped.items():
+    surfaces: dict[str, pricing.VolSurface] = {}
+    thin: list[tuple[str, str]] = []
+    for key, group in sorted(grouped.items()):
+        symbol, expiry = key
         strikes = [u.strike for u in group]
-        vols = [u.iv for u in group]
-        forward = group[0].forward(0.0, group[0].years or 0.0, cfg.rate)
-        if len({round(float(s), 6) for s in strikes}) >= 3:
-            skews[key] = pricing.VolSkew.from_strikes(
-                group[0].years or 0.0, forward, strikes, vols
-            )
-            continue
-        if cfg.fetch_skew:
+        distinct = len({round(float(s), 6) for s in strikes})
+        if distinct < 3 and cfg.fetch_skew:
             fetched = await _fetch_skew(group[0], key)
             if fetched is not None:
-                skews[key] = fetched
+                surfaces.setdefault(symbol, pricing.VolSurface()).add(fetched)
                 continue
-        warnings.append(
-            f"{key[0]} {key[1]}: only {len(set(strikes))} strike(s) held, which does not "
-            "define a smile — this expiry was repriced sticky_strike. Pass "
-            "fetch_skew=true to pull neighbouring strikes from IB."
+        if distinct < 3:
+            thin.append(key)
+            continue
+        forward = group[0].forward(0.0, group[0].years or 0.0, cfg.rate)
+        surfaces.setdefault(symbol, pricing.VolSurface()).add(
+            pricing.VolSkew.from_strikes(
+                group[0].years or 0.0, forward, strikes, [u.iv for u in group]
+            )
         )
-    return skews, warnings
+
+    for symbol, expiry in thin:
+        held = len({u.strike for u in grouped[(symbol, expiry)]})
+        if symbol in surfaces:
+            warnings.append(
+                f"{symbol} {expiry}: only {held} strike(s) held on this expiry, so its "
+                f"smile shape was interpolated from the other {symbol} tenors in total "
+                "variance. The volatility level is still IB's own for each contract; "
+                "only the moneyness response is borrowed."
+            )
+        else:
+            warnings.append(
+                f"{symbol} {expiry}: only {held} strike(s) held, and no other {symbol} "
+                "expiry defines a smile either, so this expiry was repriced "
+                "sticky_strike. Pass fetch_skew=true to pull neighbouring strikes "
+                "from IB."
+            )
+    return surfaces, warnings
 
 
 async def _fetch_skew(unit: RiskUnit, key: tuple[str, str]) -> pricing.VolSkew | None:
@@ -401,11 +530,80 @@ async def _fetch_skew(unit: RiskUnit, key: tuple[str, str]) -> pricing.VolSkew |
     )
 
 
+def surface_report(surfaces: dict[str, pricing.VolSurface]) -> list[dict[str, Any]]:
+    """Every quote that went into the surface, so the caller can see what the
+    repricing actually read.
+
+    Without this the sticky-moneyness result is unfalsifiable: a surface that
+    came back empty reprices exactly like sticky_strike, and from the outside
+    the two are indistinguishable. An empty list here means the moneyness
+    response was never applied, whatever ``volMode`` says.
+    """
+    out: list[dict[str, Any]] = []
+    for symbol, surface in sorted(surfaces.items()):
+        for years in surface.tenors:
+            skew = surface.skews[years]
+            out.append(
+                {
+                    "underlying": symbol,
+                    "yearsToExpiry": round(float(years), 6),
+                    "forward": round(float(skew.forward), 4),
+                    "points": [
+                        {
+                            "strike": round(float(skew.forward * math.exp(k)), 4),
+                            "iv": round(float(v), 6),
+                        }
+                        for k, v in zip(skew.log_moneyness, skew.vols)
+                    ],
+                }
+            )
+    return out
+
+
+def smile_shift(
+    unit: RiskUnit,
+    shock: float,
+    cfg: StressConfig,
+    surfaces: dict[str, pricing.VolSurface],
+    years_then: float | None = None,
+) -> float:
+    """How far the smile alone moves this strike's volatility, in points.
+
+    Read as a **difference** — the surface at the shocked (tenor, moneyness)
+    minus the surface at today's — rather than as an absolute lookup. That
+    matters for two reasons.
+
+    It keeps IB's own volatility as the anchor. IB publishes a volatility for
+    *this exact contract*, out of a model that prices American exercise; a
+    fitted surface is an interpolation of several of them. Reading the level off
+    the fit would discard the better number in favour of a worse one, on every
+    contract, at every shock.
+
+    And it keeps the curve exactly zero at zero shock. An absolute lookup only
+    returns a unit's own volatility where the fit happens to pass through its
+    strike — true for a strike that helped define its own expiry's smile, false
+    for one whose shape was borrowed from another tenor. A difference is zero at
+    zero shock by construction, for every contract.
+    """
+    surface = surfaces.get(unit.symbol)
+    if surface is None or unit.strike is None:
+        return 0.0
+    years_now = float(unit.years or 0.0)
+    if years_then is None:
+        years_then = years_now
+    now = surface.iv(years_now, float(unit.strike), unit.forward(0.0, years_now, cfg.rate))
+    then = surface.iv(years_then, float(unit.strike), unit.forward(shock, years_then, cfg.rate))
+    if now is None or then is None:
+        return 0.0
+    return float(then - now)
+
+
 def shocked_vol(
     unit: RiskUnit,
     shock: float,
     cfg: StressConfig,
-    skews: dict[tuple[str, str], pricing.VolSkew],
+    surfaces: dict[str, pricing.VolSurface],
+    years_then: float | None = None,
 ) -> float:
     """The volatility to reprice this contract at, under this shock.
 
@@ -415,26 +613,55 @@ def shocked_vol(
     volatility than the one it holds today.
 
     ``sticky_moneyness`` — the smile travels with the forward, so the strike
-    picks up the volatility that currently belongs to its new moneyness. The
-    lookup is done on the *unshocked* smile at ``ln(K/F')``, which is what makes
-    it a lookup rather than a refit.
+    picks up the volatility belonging to its new moneyness, at its own tenor,
+    interpolated across strike *and* expiry. It arrives as the shift computed by
+    :func:`smile_shift`, on top of IB's volatility rather than in place of it.
 
     Neither mode moves the *level* of the surface: one pins volatility to the
-    strike, the other reads it off the smile the portfolio has today. The
-    level's own response to the shock is :func:`vol_response`, and it is added
-    on top of whichever mode is in use — the two answer different questions and
-    do not overlap.
+    strike, the other slides the strike along the smile the portfolio has today.
+    The level's own response to the shock is :func:`vol_response`, and it is
+    added on top of whichever mode is in use — the two answer different
+    questions and do not overlap.
 
     ``shock`` here is the move of *this* position's underlying, already scaled
     by its beta, so a position attenuated on the shock axis gets an attenuated
     volatility response to match.
     """
     base = float(unit.iv or 0.0)
-    if cfg.vol_mode == "sticky_moneyness" and unit.skew_key in skews:
-        skew = skews[unit.skew_key]
-        new_forward = unit.forward(shock, unit.years or 0.0, cfg.rate)
-        base = skew.at_strike(float(unit.strike), forward=new_forward)
+    if cfg.vol_mode == "sticky_moneyness":
+        base += smile_shift(unit, shock, cfg, surfaces, years_then)
+    if cfg.vol_coord:
+        years = float(unit.years or 0.0) if years_then is None else years_then
+        base *= vol_coord_factor(shock, years, cfg)
+        return max(base + cfg.vol_bump, pricing.MIN_VOL)
     return max(base + cfg.vol_bump + vol_response(shock, cfg), pricing.MIN_VOL)
+
+
+def vol_coord_factor(shock: float, years: float, cfg: StressConfig) -> float:
+    """IB's volatility-coordinated shock, as a multiplier on each volatility.
+
+    Two things distinguish it from the additive slopes, and both matter.
+
+    **It is relative.** The nominal shock multiplies the volatility a contract
+    already has, so a wing quoted at 41% picks up more points than a 31%
+    at-the-money from the very same scenario. That is a steepening surface, and
+    it falls out of the form rather than being bolted on. A parallel shift in
+    points cannot produce it at any slope — which is why, on a book that is
+    short the middle and long both wings, the additive model made the curve
+    monotonically worse where Risk Navigator turns it back up.
+
+    **It is damped across tenors.** ``VR(t)`` is 1 at zero and decreasing, so
+    the front month takes the shock almost whole and a six-month option takes a
+    fraction of it. Without that the model is unusable: undamped, a 20% fall
+    triples every volatility on the board.
+
+    The asymmetry is IB's documented one — a fall moves volatility ten times
+    as hard as a rise of the same size. ``VR`` itself is not published, and
+    ``vol_coord_decay`` is this server's fit to a live curve, not IB's number.
+    """
+    nominal = cfg.vol_coord_down * (-shock) if shock < 0 else -cfg.vol_coord_up * shock
+    vr = math.exp(-cfg.vol_coord_decay * max(years, 0.0))
+    return max(1.0 + nominal * vr, 0.0)
 
 
 def vol_response(shock: float, cfg: StressConfig) -> float:
@@ -498,7 +725,7 @@ def unit_pnl(
     unit: RiskUnit,
     shock: float,
     cfg: StressConfig,
-    skews: dict[tuple[str, str], pricing.VolSkew],
+    surfaces: dict[str, pricing.VolSurface],
 ) -> float:
     """P&L for one position under one shock.
 
@@ -540,7 +767,8 @@ def unit_pnl(
         years_now = float(unit.years)
         years_then = max(years_now - cfg.date_offset_days / C.DAYS_PER_YEAR, pricing.MIN_YEARS)
         base = unit.model_price(0.0, float(unit.iv), years_now, cfg.rate)
-        shocked = unit.model_price(eff, shocked_vol(unit, eff, cfg, skews), years_then, cfg.rate)
+        vol = shocked_vol(unit, eff, cfg, surfaces, years_then)
+        shocked = unit.model_price(eff, vol, years_then, cfg.rate)
         return (shocked - base) * unit.position * unit.multiplier
 
     if unit.asset_class == "equity":
@@ -610,7 +838,7 @@ def trough_of(points: list[tuple[float, float]]) -> dict[str, Any]:
 def run_curve(
     units: Sequence[RiskUnit],
     cfg: StressConfig,
-    skews: dict[tuple[str, str], pricing.VolSkew],
+    surfaces: dict[str, pricing.VolSurface],
 ) -> dict[str, Any]:
     """The P&L curve and its trough for one set of units."""
     rows: list[dict[str, Any]] = []
@@ -619,7 +847,7 @@ def run_curve(
         by_symbol: dict[str, float] = {}
         total = 0.0
         for unit in units:
-            pnl = unit_pnl(unit, shock, cfg, skews)
+            pnl = unit_pnl(unit, shock, cfg, surfaces)
             total += pnl
             by_class[unit.asset_class] = by_class.get(unit.asset_class, 0.0) + pnl
             by_symbol[unit.symbol] = by_symbol.get(unit.symbol, 0.0) + pnl
@@ -790,7 +1018,9 @@ def excluded_report(units: Sequence[RiskUnit], cfg: StressConfig) -> list[dict[s
     ]
 
 
-def scope_warnings(units: Sequence[RiskUnit], cfg: StressConfig) -> list[str]:
+def scope_warnings(
+    units: Sequence[RiskUnit], cfg: StressConfig, *, include_vol: bool = True
+) -> list[str]:
     """What the beta and the volatility slope did to the curve's meaning.
 
     Both are improvements that make a result *less* self-evident. A beta below
@@ -834,6 +1064,11 @@ def scope_warnings(units: Sequence[RiskUnit], cfg: StressConfig) -> list[str]:
             "`pnl_by_symbol`; their own scenario is not modelled by this server."
         )
 
+    if not include_vol:
+        # stress_curve varies the slope per curve, so one sentence about "the"
+        # slope would be wrong for every scenario but one. It says it itself.
+        return out
+
     if cfg.vol_slope_down or cfg.vol_slope_up:
         out.append(
             f"Implied volatility responds to the shock at {cfg.vol_slope_down:g} point(s) "
@@ -869,6 +1104,17 @@ def assumptions(cfg: StressConfig) -> dict[str, Any]:
             "sell-off brings with it; a net short option book loses money on that term "
             "and none of it is in this curve."
         ),
+        "volCoord": cfg.vol_coord,
+        "volCoordModel": (
+            "IB's volatility-coordinated form: every volatility is multiplied by "
+            f"(1 + Y*VR(t)), Y = {cfg.vol_coord_down:g}*|shock| on a fall and "
+            f"-{cfg.vol_coord_up:g}*shock on a rise, VR(t) = exp(-{cfg.vol_coord_decay:g}*t). "
+            "The asymmetry is IB's documented one; the decay is this server's fit to a "
+            "live Vol.Coord. curve and is not published by IB. Because the shock is "
+            "relative, the surface steepens on its own."
+            if cfg.vol_coord
+            else None
+        ),
         "dateOffsetDays": cfg.date_offset_days,
         "riskFreeRate": cfg.rate,
         "scope": cfg.scope,
@@ -901,7 +1147,7 @@ async def stress_portfolio(cfg: StressConfig) -> dict[str, Any]:
     ib = await connection.get()
     holdings = await MD.load_holdings(with_greeks=True)
     units = [unit_from_holding(h, cfg.asof) for h in holdings]
-    skews, warnings = await build_skews(units, cfg)
+    surfaces, warnings = await build_surfaces(units, cfg)
 
     unpriceable = [u for u in units if u.asset_class == "option" and not u.priceable]
     if unpriceable:
@@ -926,14 +1172,17 @@ async def stress_portfolio(cfg: StressConfig) -> dict[str, Any]:
             f"Held flat because this server does not model them: {', '.join(sorted(other))}."
         )
     warnings.extend(scope_warnings(units, cfg))
+    if cfg.vol_coord:
+        warnings.extend(vol_coord_warnings(units, cfg))
 
-    result = run_curve(units, cfg, skews)
+    result = run_curve(units, cfg, surfaces)
     reconciliation = reconcile(holdings, ib, connection.require_account())
     return {
         **result,
         "reconciliation": reconciliation,
         "reconciled": reconciliation.get("reconciled", False),
         "assumptions": assumptions(cfg),
+        "volSurfaceUsed": surface_report(surfaces),
         "excluded": excluded_report(units, cfg),
         "positions": _position_report(units, cfg),
         "warnings": warnings,
@@ -955,7 +1204,7 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
     leg_units, leg_problems = await units_from_legs(legs, cfg.asof)
     combined = base_units + leg_units
 
-    skews, warnings = await build_skews(combined, cfg)
+    surfaces, warnings = await build_surfaces(combined, cfg)
     if leg_problems:
         warnings.append(
             f"{len(leg_problems)} leg(s) could not be priced and are not in the "
@@ -964,8 +1213,8 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
         )
     warnings.extend(scope_warnings(combined, cfg))
 
-    base = run_curve(base_units, cfg, skews)
-    withlegs = run_curve(combined, cfg, skews)
+    base = run_curve(base_units, cfg, surfaces)
+    withlegs = run_curve(combined, cfg, surfaces)
     diff_points = [
         {
             "shock": b["shock"],
@@ -995,8 +1244,418 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
         "legs": _position_report(leg_units, cfg),
         "legProblems": leg_problems,
         "excluded": excluded_report(combined, cfg),
+        "volSurfaceUsed": surface_report(surfaces),
         "reconciliation": reconciliation,
         "reconciled": reconciliation.get("reconciled", False),
         "assumptions": assumptions(cfg),
+        "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# the multi-regime curve
+# --------------------------------------------------------------------------
+
+
+def reference_underlying(units: Sequence[RiskUnit], cfg: StressConfig) -> dict[str, Any] | None:
+    """The instrument whose price the shock axis is quoted against.
+
+    The curve's x-axis is a percentage, which is unambiguous but hard to read
+    against a chart: "the trough is at −18%" is a weaker statement than "the
+    trough is at 5764". Naming one underlying and printing its shocked level at
+    every point closes that gap.
+
+    It is a *label*, not a model input — nothing is priced off it. The engine
+    still shocks every in-scope underlying by the same percentage, each at its
+    own price, so a book on two underlyings is not being collapsed onto one
+    here. The heaviest in-scope exposure wins, which on an index book is the
+    front-month future the options hang off.
+    """
+    best: dict[str, dict[str, float]] = {}
+    for unit in units:
+        if not in_scope(unit, cfg):
+            continue
+        name = unit.und_symbol or unit.symbol
+        if unit.asset_class == "option" and unit.priceable:
+            price = float(unit.und_price or 0.0)
+            weight = abs(unit.position * unit.multiplier * price)
+        elif unit.asset_class == "future" and unit.notional and unit.position and unit.multiplier:
+            price = float(unit.notional) / (unit.position * unit.multiplier)
+            weight = abs(float(unit.notional))
+        elif unit.asset_class == "equity" and unit.market_value and unit.position:
+            price = float(unit.market_value) / unit.position
+            weight = abs(float(unit.market_value))
+        else:
+            continue
+        if price <= 0:
+            continue
+        row = best.setdefault(name, {"weight": 0.0, "price": price, "heaviest": 0.0})
+        row["weight"] += weight
+        # The price is taken from the single heaviest position rather than
+        # averaged: two ES expiries hang off two different futures, and their
+        # mean is a level neither of them trades at.
+        if weight >= row["heaviest"]:
+            row["heaviest"] = weight
+            row["price"] = price
+    if not best:
+        return None
+    name, row = max(best.items(), key=lambda kv: kv[1]["weight"])
+    return {"symbol": name, "spot": round(row["price"], 4)}
+
+
+def curve_points(
+    rows: Sequence[dict[str, Any]],
+    spot: float | None,
+    net_liquidation: float | None,
+) -> list[dict[str, Any]]:
+    """The engine's rows, restated in the units a reader plots in.
+
+    ``pnl_pct_of_nlv`` is the one that travels: a 43,000 loss means nothing
+    without the account beside it, and a reader comparing two dates or two
+    accounts needs the fraction rather than the amount. It is omitted rather
+    than defaulted when NetLiquidation is unavailable — a percentage of an
+    assumed denominator is worse than no percentage.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        shock = float(row["shock"])
+        pnl = float(row["pnl_total"])
+        point: dict[str, Any] = {
+            "shock": round(shock, 6),
+            "shock_pct": round(shock * 100.0, 4),
+            "pnl": round(pnl, 2),
+            "pnl_by_asset_class": row["pnl_by_asset_class"],
+            "pnl_by_symbol": row["pnl_by_symbol"],
+        }
+        if spot:
+            point["underlying"] = round(spot * (1.0 + shock), 4)
+        if net_liquidation:
+            point["portfolio_value"] = round(net_liquidation + pnl, 2)
+            point["pnl_pct_of_nlv"] = round(pnl / net_liquidation, 6)
+        out.append(point)
+    return out
+
+
+async def stress_curve(
+    cfg: StressConfig, scenarios: Sequence[VolScenario]
+) -> dict[str, Any]:
+    """One curve per volatility regime, over one loading of the portfolio.
+
+    The regimes differ only in how the volatility *level* responds to the shock,
+    which is the assumption Risk Navigator hides. ``vol_slope_down=0`` is the
+    constant-volatility curve — its blue line, and the one to check first: if
+    that does not line up, the surface lookup is wrong and no other regime is
+    worth reading.
+
+    Everything expensive happens once. Positions, greeks and the volatility
+    surface are loaded a single time and every scenario is repriced against the
+    same snapshot, so the curves are differences in assumption rather than
+    differences in market data — which running the single-curve tool three times
+    could not guarantee, since the book moves between calls.
+    """
+    cfg.validate()
+    if not scenarios:
+        raise ValueError("stress_curve needs at least one volatility scenario")
+    names = [s.name for s in scenarios]
+    if len(set(names)) != len(names):
+        raise ValueError(f"scenario names must be unique, got {names}")
+    for scenario in scenarios:
+        replace(cfg, **scenario.overrides()).validate()
+
+    ib = await connection.get()
+    holdings = await MD.load_holdings(with_greeks=True)
+    units = [unit_from_holding(h, cfg.asof) for h in holdings]
+    surfaces, warnings = await build_surfaces(units, cfg)
+    surface_rows = surface_report(surfaces)
+
+    unpriceable = [u for u in units if u.asset_class == "option" and not u.priceable]
+    if unpriceable:
+        warnings.append(
+            f"{len(unpriceable)} option position(s) had no usable model greeks and were "
+            "held flat across every shock, in every scenario — each curve understates "
+            "the risk by whatever they carry. They are listed in `positions` with a note."
+        )
+    implied_locally = [u for u in units if u.asset_class == "option" and u.priceable and u.note]
+    if implied_locally:
+        warnings.append(
+            f"{len(implied_locally)} option position(s) are repriced from a volatility "
+            "implied locally off the mark price, because IB published no model greeks "
+            "for them — commonly a missing market data entitlement. They are in the "
+            "curves, but they are this server's numbers rather than IB's. See `positions`."
+        )
+    other = {u.symbol for u in units if u.asset_class == "other"}
+    if other:
+        warnings.append(
+            f"Held flat because this server does not model them: {', '.join(sorted(other))}."
+        )
+    if cfg.vol_mode == "sticky_moneyness" and not surface_rows:
+        warnings.append(
+            "volMode is 'sticky_moneyness' and `volSurfaceUsed` is EMPTY: no expiry in "
+            "this portfolio held three strikes, so no smile could be built and every "
+            "option was repriced sticky_strike instead. The moneyness response is not in "
+            "these curves at all. Pass fetch_skew=true, or read the result as "
+            "sticky_strike."
+        )
+    warnings.extend(scope_warnings(units, cfg, include_vol=False))
+    if any(sc.vol_coord for sc in scenarios):
+        warnings.extend(vol_coord_warnings(units, cfg))
+    # This used to be unconditional, from when every scenario was an additive
+    # slope. Left that way it described a parallel shift flat across tenors on a
+    # run whose only volatility model was vol_coord — which is relative and
+    # damped by tenor, so the sentence contradicted the thing it was attached
+    # to. A warning that misdescribes the model in use is worse than no warning.
+    if any(sc.vol_slope_down or sc.vol_slope_up for sc in scenarios):
+        warnings.append(
+            "One or more curves use an additive volatility slope, which is your "
+            "assumption rather than a measurement, and is applied as a parallel shift of "
+            "the whole surface, flat across tenors. A real surface steepens in a "
+            "sell-off, which understates a long out-of-the-money put, and a long-dated "
+            "position moves less than the front month a slope is usually calibrated on. "
+            "vol_coord has neither limitation and is the better choice unless you "
+            "specifically want a flat regime."
+        )
+    warnings.append(
+        "Each curve is one assumption about volatility, and which is worst depends on "
+        "where you are on the axis rather than being fixed. Compare them against each "
+        "other rather than reading any one of them as the answer."
+    )
+
+    reconciliation = reconcile(holdings, ib, connection.require_account())
+    net_liq = reconciliation.get("netLiquidation")
+    reference = reference_underlying(units, cfg)
+    spot = float(reference["spot"]) if reference else None
+
+    # `assumptions` describes one config, and here there are several. The
+    # volatility terms are the only ones that differ, so they are replaced by a
+    # pointer to the curves rather than left reporting the base config's zeros
+    # — which would read as "volatility is held constant" on a result whose
+    # whole purpose is that it is not.
+    shared = assumptions(cfg)
+    for key in ("volSlopeDown", "volSlopeUp", "volBump"):
+        shared.pop(key, None)
+    shared["volatilityLevel"] = (
+        "varies by curve: each entry under `curves` carries its own volSlopeDown "
+        "(volatility points added per 1% fall), volSlopeUp and volBump, applied as a "
+        "parallel shift of the whole surface. A curve with volSlopeDown 0 is the "
+        "constant-volatility case — the one to check against Risk Navigator first."
+    )
+    shared["volScenarios"] = [
+        {
+            "name": s.name,
+            "volSlopeDown": s.vol_slope_down,
+            "volSlopeUp": s.vol_slope_up,
+            "volBump": s.vol_bump,
+        }
+        for s in scenarios
+    ]
+
+    curves: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        scfg = replace(cfg, **scenario.overrides())
+        result = run_curve(units, scfg, surfaces)
+        points = curve_points(result["curve"], spot, net_liq)
+        entry: dict[str, Any] = {
+            "name": scenario.name,
+            "volSlopeDown": scenario.vol_slope_down,
+            "volSlopeUp": scenario.vol_slope_up,
+            "volBump": scenario.vol_bump,
+            "volCoord": scenario.vol_coord,
+            "points": points,
+            "trough": result["trough"],
+            "peak": result["peak"],
+        }
+        if "troughRefined" in result:
+            entry["troughRefined"] = result["troughRefined"]
+        worst = min(points, key=lambda p: p["pnl"])
+        entry["minPnl"] = worst["pnl"]
+        entry["minAtShockPct"] = worst["shock_pct"]
+        if "pnl_pct_of_nlv" in worst:
+            entry["minPnlPctOfNlv"] = worst["pnl_pct_of_nlv"]
+        if "underlying" in worst:
+            entry["minAtUnderlying"] = worst["underlying"]
+        curves.append(entry)
+
+    return {
+        "underlying": reference,
+        "netLiquidation": net_liq,
+        "curves": curves,
+        "volSurfaceUsed": surface_rows,
+        "reconciliation": reconciliation,
+        "reconciled": reconciliation.get("reconciled", False),
+        "assumptions": shared,
+        "excluded": excluded_report(units, cfg),
+        "positions": _position_report(units, cfg),
+        "warnings": warnings,
+    }
+
+
+# --------------------------------------------------------------------------
+# calibrating vol_coord
+# --------------------------------------------------------------------------
+
+
+def vol_coord_warnings(units: Sequence[RiskUnit], cfg: StressConfig) -> list[str]:
+    """What the reader has to know before believing a ``vol_coord`` curve.
+
+    Two separate admissions, and neither should have to be inferred from
+    `assumptions`. The decay is a fit to somebody else's Risk Navigator; and
+    the fit had nothing to say about tenors longer than the book it was fitted
+    on, where an exponential runs to zero and quietly reports a long-dated
+    option as having no volatility risk at all.
+    """
+    out: list[str] = []
+    if cfg.vol_coord_decay == DEFAULT_VOL_COORD_DECAY:
+        out.append(
+            f"vol_coord is running on the factory decay of {DEFAULT_VOL_COORD_DECAY:g}. IB "
+            "documents that VR(t) exists and is decreasing but not what it is, so this "
+            "number is a FIT — to one Risk Navigator screenshot, on one account, from "
+            "nine points read off a chart by eye. The 10x/1x asymmetry above it is IB's "
+            "own and is on firmer ground than the damping is. Recalibrate against your "
+            "own Risk Navigator with scripts/calibrate_vol_coord.py before treating a "
+            "vol_coord curve as anything but indicative."
+        )
+
+    limit = cfg.vol_coord_calibrated_to_years
+    beyond = sorted(
+        {
+            u.label
+            for u in units
+            if u.asset_class == "option"
+            and u.priceable
+            and in_scope(u, cfg)
+            and float(u.years or 0.0) > limit
+        }
+    )
+    if beyond:
+        worst = max(
+            float(u.years or 0.0)
+            for u in units
+            if u.asset_class == "option" and u.priceable and in_scope(u, cfg)
+        )
+        vr = math.exp(-cfg.vol_coord_decay * worst)
+        out.append(
+            f"{len(beyond)} option position(s) expire beyond {limit:.2f} years, which is "
+            f"as far as the vol_coord damping was ever calibrated — the longest is "
+            f"{worst:.2f} years, where VR(t) is {vr:.3f}. Past the calibration the "
+            "exponential is extrapolation and it decays to nothing: at that tenor this "
+            f"model moves volatility by {vr * 100:.1f}% of the nominal shock, so those "
+            "positions are being priced as though a crash barely touched their "
+            "volatility. That is almost certainly wrong, and it understates the risk of "
+            f"anything long-dated. Affected: {', '.join(beyond[:8])}"
+            + (f" and {len(beyond) - 8} more" if len(beyond) > 8 else "")
+            + "."
+        )
+    return out
+
+
+def calibrate_vol_coord(
+    units: Sequence[RiskUnit],
+    cfg: StressConfig,
+    targets: Mapping[float, float],
+    surfaces: dict[str, pricing.VolSurface] | None = None,
+) -> dict[str, Any]:
+    """Fit ``vol_coord_decay`` to a Risk Navigator ``Vol.Coord.`` curve.
+
+    ``targets`` maps a shock, as a fraction, to the portfolio P&L Risk
+    Navigator shows there. Read them off its Vol.Coord. line — the curve, not
+    the blue one — and give at least four, spread across the range you care
+    about rather than bunched near the money.
+
+    This exists so the decay stops being a constant somebody once fitted and
+    becomes a number you can rederive. What comes back is not only the fit but
+    what to distrust about it: the residual at every point, the tenor range the
+    targets actually constrain, and the most extreme volatility the fitted model
+    produces. A decay that reproduces the curve by pricing a wing at 150% has
+    fitted the chart rather than the market, and that is visible here rather
+    than three layers down in a P&L.
+    """
+    from scipy.optimize import least_squares
+
+    if len(targets) < 3:
+        raise ValueError(
+            "a decay cannot be fitted to fewer than three points; four or more spread "
+            "across the range is what makes the answer mean anything"
+        )
+    surfaces = surfaces or {}
+    shocks = sorted(targets)
+    observed = [float(targets[s]) for s in shocks]
+
+    def curve_at(decay: float) -> list[float]:
+        fitted = replace(cfg, vol_coord=True, vol_coord_decay=float(decay))
+        rows = run_curve(units, replace(fitted, shocks=shocks), surfaces)["curve"]
+        return [float(r["pnl_total"]) for r in rows]
+
+    result = least_squares(
+        lambda p: [m - o for m, o in zip(curve_at(p[0]), observed)],
+        x0=[DEFAULT_VOL_COORD_DECAY],
+        bounds=([0.0], [200.0]),
+        # run_curve rounds P&L to the cent, and the default finite-difference
+        # step is relative and around 1e-8 — small enough that the perturbed
+        # curve rounds to exactly the same numbers, the gradient reads as zero
+        # and the fit returns x0 looking like it converged. The step has to be
+        # coarse enough to move a cent.
+        diff_step=1e-3,
+    )
+    decay = float(result.x[0])
+    modelled = curve_at(decay)
+    residuals = [m - o for m, o in zip(modelled, observed)]
+    rms = math.sqrt(sum(r * r for r in residuals) / len(residuals))
+
+    priced = [
+        u
+        for u in units
+        if u.asset_class == "option" and u.priceable and in_scope(u, cfg)
+    ]
+    tenors = [float(u.years or 0.0) for u in priced]
+    deepest = min(shocks)
+    fitted_cfg = replace(cfg, vol_coord=True, vol_coord_decay=decay)
+    repriced = [
+        (shocked_vol(u, deepest, fitted_cfg, surfaces), u.label, float(u.iv or 0.0))
+        for u in priced
+    ]
+    repriced.sort(reverse=True)
+
+    warnings: list[str] = []
+    if repriced and repriced[0][0] > 1.5:
+        warnings.append(
+            f"At {deepest:+.0%} this decay prices {repriced[0][1]} at "
+            f"{repriced[0][0]:.0%} implied volatility, up from {repriced[0][2]:.0%}. A fit "
+            "that reproduces the curve by putting a wing above 150% has fitted the chart "
+            "rather than the market. Treat the decay as unusable and check whether the "
+            "targets were read off the right line."
+        )
+    if tenors and max(tenors) < 1.0:
+        warnings.append(
+            f"These targets only constrain tenors out to {max(tenors):.2f} years, because "
+            "that is all the portfolio holds. VR(t) beyond it is extrapolation, and an "
+            "exponential extrapolates to zero — meaning no volatility response at all on "
+            "a long-dated position. Set vol_coord_calibrated_to_years to "
+            f"{max(tenors):.3f} so the engine says so when it is asked to price past it."
+        )
+
+    return {
+        "decay": round(decay, 4),
+        "rms": round(rms, 2),
+        "points": [
+            {
+                "shock": round(s, 6),
+                "target": round(o, 2),
+                "model": round(m, 2),
+                "residual": round(r, 2),
+            }
+            for s, o, m, r in zip(shocks, observed, modelled, residuals)
+        ],
+        "calibratedToYears": round(max(tenors), 4) if tenors else None,
+        "tenorsCovered": sorted({round(t, 3) for t in tenors}),
+        "mostExtremeVol": (
+            {
+                "label": repriced[0][1],
+                "atShock": round(deepest, 6),
+                "impliedVolBefore": round(repriced[0][2], 4),
+                "impliedVolAfter": round(repriced[0][0], 4),
+            }
+            if repriced
+            else None
+        ),
         "warnings": warnings,
     }

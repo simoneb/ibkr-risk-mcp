@@ -164,6 +164,71 @@ async def step_stress(shock_range: float, step: float) -> dict[str, Any] | None:
     return result
 
 
+async def step_stress_curve() -> None:
+    """The multi-regime curve, run the way the tool actually defaults.
+
+    Forcing a non-default vol_mode here was worse than useless: the step passed
+    while printing a constant-volatility trough of -91,923 where the default
+    gives -52,311, and the number a reader would have taken to Risk Navigator
+    was the one that cannot be compared to it. The surface path still needs
+    exercising, so it gets its own run below rather than distorting this one.
+    """
+    cfg = S.StressConfig(shocks=list(S.DEFAULT_SHOCKS))
+    result = await S.stress_curve(cfg, list(S.DEFAULT_VOL_SCENARIOS))
+
+    curves = result["curves"]
+    lines = []
+    for c in curves:
+        at = f"{c['minAtShockPct']:+.0f}%"
+        if c.get("minAtUnderlying"):
+            at += f" ({c['minAtUnderlying']:,.0f})"
+        pct = f" [{c['minPnlPctOfNlv']:+.2%} of NLV]" if c.get("minPnlPctOfNlv") else ""
+        how = "IB vol-coordinated" if c.get("volCoord") else f"slope {c['volSlopeDown']:g}"
+        lines.append(f"{c['name']} ({how}): {c['minPnl']:,.0f} at {at}{pct}")
+    detail = f"{len(curves)} curve(s) over {len(curves[0]['points'])} shocks\n       " + (
+        "\n       ".join(lines)
+    )
+
+    const = next((c for c in curves if c["volSlopeDown"] == 0.0), None)
+    if const is None:
+        record("WARN", "stress_curve", detail + "\n       no slope-0 curve to check against")
+        return
+    zero = next((p for p in const["points"] if p["shock"] == 0.0), None)
+    if zero is None:
+        record("WARN", "stress_curve", detail + "\n       no zero shock on the axis to check")
+        return
+    detail += f"\n       const P&L at zero shock: {zero['pnl']:,.2f} (must be 0.00)"
+    record("FAIL" if abs(zero["pnl"]) > 0.01 else "PASS", "stress_curve", detail)
+
+    # The default is sticky_strike, which builds no surface by design. The
+    # surface path is real code and still has to run, so it gets its own pass.
+    moneyness = await S.stress_curve(
+        S.StressConfig(shocks=[-0.10, 0.0], vol_mode="sticky_moneyness"),
+        [S.VolScenario("const")],
+    )
+    surface = moneyness["volSurfaceUsed"]
+    if not surface:
+        record(
+            "WARN",
+            "vol surface used",
+            "EMPTY under sticky_moneyness: no expiry held three strikes, so every option "
+            "was repriced sticky_strike. Not a server fault if the account holds few "
+            "options, but the moneyness response would not be in such a curve.",
+        )
+        return
+    quotes = sum(len(row["points"]) for row in surface)
+    record(
+        "PASS",
+        "vol surface used",
+        f"{quotes} quote(s) over {len(surface)} tenor(s): "
+        + "; ".join(
+            f"{row['underlying']} {row['yearsToExpiry']:.3f}y fwd {row['forward']:,.1f} "
+            f"({len(row['points'])} strikes)"
+            for row in surface[:5]
+        ),
+    )
+
+
 async def step_stress_whatif(
     holdings: list[MD.Holding], fallback_symbol: str, fallback_sec_type: str
 ) -> None:
@@ -174,12 +239,20 @@ async def step_stress_whatif(
     cfg = S.StressConfig(shocks=[round(-0.30 + i * 0.02, 4) for i in range(31)])
     result = await S.stress_whatif([leg], cfg)
     t = result["troughs"]
+    # A leg that changes nothing at any shock means the comparison never
+    # happened — unpriced, or taken off the axis by the scope. That used to
+    # report PASS, which is the worst way for a check to be wrong.
+    moved = any(row["pnl_total"] for row in result["difference"]["curve"])
+    status = "WARN" if result["legProblems"] else ("PASS" if moved else "FAIL")
     record(
-        "PASS" if not result["legProblems"] else "WARN",
+        status,
         "stress_whatif",
         f"base trough {t['base']['pnl']:,.0f} at {t['base']['shock']:+.1%} -> with leg "
         f"{t['withLegs']['pnl']:,.0f} at {t['withLegs']['shock']:+.1%}; the difference "
         f"troughs at {t['difference']['pnl']:,.0f} at {t['difference']['shock']:+.1%}"
+        + ("" if moved else "\n       the leg moved the curve by exactly "
+           "zero at every shock: it was either not priced or excluded by the "
+           "scope, so nothing was actually compared")
         + (f"\n       legProblems: {result['legProblems']}" if result["legProblems"] else ""),
     )
 
@@ -250,7 +323,23 @@ async def _far_otm_leg(holdings: list[MD.Holding]) -> C.Leg | None:
     wrong about.
     """
     options = [h for h in holdings if h.is_option and h.greeks and h.greeks.get("undPrice")]
-    if not options:
+    # It has to be an *equity* underlying. Taking whatever came first put the
+    # leg on the account's CAD option, which scope='equity' then excluded — so
+    # the what-if step compared a curve against itself, reported a difference of
+    # exactly zero, and passed without testing anything.
+    # Two conditions, both learned the hard way. It has to be an *equity*
+    # underlying, or scope='equity' excludes the leg and the what-if compares a
+    # curve against itself. And it has to be one IB actually prices: the first
+    # equity option here was a CSCO strike the account has no data entitlement
+    # for, so the leg came back unpriced and the difference was again exactly
+    # zero. Prefer an underlying whose greeks arrived from IB.
+    options.sort(
+        key=lambda h: (
+            C.risk_group(h.contract) != "equity",
+            bool((h.greeks or {}).get("source")),
+        )
+    )
+    if not options or C.risk_group(options[0].contract) != "equity":
         return None
     ref = options[0]
     und = float(ref.greeks["undPrice"])
@@ -427,6 +516,7 @@ async def main() -> int:
         holdings = await step_greeks()
         await step_surface(holdings, args.probe_underlying, args.probe_sec_type)
         await step_stress(args.shock_range, args.step)
+        await step_stress_curve()
         await step_stress_whatif(holdings, args.probe_underlying, args.probe_sec_type)
         await step_whatif(holdings, args.probe_underlying, args.probe_sec_type)
     finally:

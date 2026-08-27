@@ -7,6 +7,7 @@ It deliberately does **not** duplicate the official IBKR connector. Positions, b
 The questions it is built to answer:
 
 - where is the trough of the portfolio's P&L curve across underlying shocks, at constant volatility?
+- and how much of that answer is the constant-volatility assumption itself?
 - if I add N puts at strike K expiring E, where does that trough move to?
 - how much margin does this hypothetical structure need, now and under stress?
 - what does IB's volatility surface look like for this underlying?
@@ -90,10 +91,11 @@ Copy `.env.example` to `.env` for local runs.
 | `get_position_greeks` | IB's model greeks for every option position, with both expiry dates |
 | `get_vol_surface` | IB's implied volatility grid for an underlying, by expiry and strike |
 | `stress_portfolio` | The P&L curve across underlying shocks, and its trough |
+| `stress_curve` | The same curve under several volatility regimes at once — risk-graph data, with the vol assumption as a visible parameter |
 | `stress_whatif` | The same curve with hypothetical legs added: base, with-legs, and the difference |
 | `whatif_order` | IB's margin impact of a structure, per leg and cumulatively. Needs the gate below |
 
-Each tool carries the protocol's annotations, so a client can group them by permission. Six are marked read-only; `whatif_order` is not, because it puts something on IB's order channel even though nothing is routable.
+Each tool carries the protocol's annotations, so a client can group them by permission. Seven are marked read-only; `whatif_order` is not, because it puts something on IB's order channel even though nothing is routable.
 
 ## The what-if gate
 
@@ -155,7 +157,34 @@ The classification is a table plus one heuristic — a three-letter currency cod
 
 This is what lets a foreign underlying be stood down off an equity axis — a short EUR strangle is not a 20%-down position when the S&P falls 20%, and a single shock across every underlying says it is. But read what a beta does and does not do. It scales the underlying's move only: vega and theta are untouched, so a position at beta 0 still contributes P&L the moment `vol_bump` or `date_offset_days` is set, and `pnl_by_symbol` is the only clean exclusion. More importantly, standing a position down is not measuring it — an attenuated strangle carries its whole gap risk and none of that risk is anywhere on the curve. Every run that applies a beta other than 1 says so in `warnings`.
 
-**Volatility surface interpolation is local.** Under `sticky_moneyness` the smile is built from the strikes the portfolio actually holds. Fewer than three on one expiry does not define a slope, and that expiry falls back to `sticky_strike` with a warning rather than being given an invented flat smile. `fetch_skew=true` pulls neighbouring strikes from IB instead, at the cost of more market data requests.
+**Volatility surface interpolation is local.** Under `sticky_moneyness` the surface is built from the strikes the portfolio actually holds — one skew per expiry that has at least three of them, assembled into a surface and interpolated across tenors in **total variance**. An expiry too thin to define its own slope borrows its shape from the tenors that do; an underlying where no expiry defines one falls back to `sticky_strike` rather than being handed an invented flat smile. Either way it is said in `warnings`. `fetch_skew=true` pulls neighbouring strikes from IB instead, at the cost of more market data requests.
+
+The surface supplies the *change* in volatility as a strike slides to new moneyness, not the level. The level stays IB's own per-contract implied volatility, which comes out of a model that prices American exercise and is a better number than any fit through it. Reading the level off the surface would also break the curve's zero: a strike whose shape was borrowed from another tenor would not get its own volatility back at zero shock. Every result carries `volSurfaceUsed`, the quotes the repricing actually read — **if it is empty under `sticky_moneyness`, no smile was built, every option silently fell back to `sticky_strike`, and the result is not the model you asked for.**
+
+**The volatility response is IB's own model, and both curves are validated against Risk Navigator.** Risk Navigator draws two lines: a constant-volatility curve, and one it labels `Vol.Coord.` where volatility moves as a deterministic function of the price shock. IB documents that second model's shape — the nominal shock is `-X` on a rise and `-10X` on a fall, applied **relatively** rather than in points, then damped across tenors by a response function `VR(t)` that is 1 at zero and decreasing. `vol_coord` implements it. Measured against a live index ratio book, on a −30% to 0% axis:
+
+| | RMS against Risk Navigator, as a fraction of trough depth |
+|---|---|
+| `const` vs its blue curve | **~2%** |
+| `vol_coord` vs its Vol.Coord. curve | **~3.5%** |
+
+with the residual at every shock inside the error of reading the targets off a chart by eye. `VR(t)` itself is not published: `vol_coord_decay` is fitted here, `exp(-4.736 t)`, on one book from nine points read off a chart by eye. Two things follow, and the engine says both out loud rather than leaving them in the docs.
+
+Every `vol_coord` curve running on the shipped decay **says so in `warnings`**. And the fit was constrained only out to **0.345 years**, because that is all the book it came from held; past there an exponential does not merely lose accuracy, it decays to nothing. At one year `VR` is 0.009, so this model would reprice a LEAPS as though a 20% crash barely touched its volatility. Any position beyond `vol_coord_calibrated_to_years` is priced anyway and **named in `warnings`**, because a silent extrapolation that understates long-dated vega is exactly the failure this server exists not to have. A floor on `VR` would tidy the symptom away and hide it, so there isn't one.
+
+To replace the number rather than trust it:
+
+```
+uv run python scripts/calibrate_vol_coord.py -0.05=-8000 -0.10=-22000 -0.15=-31500 -0.20=-28000 -0.25=-12000
+```
+
+Those are readings off Risk Navigator's own Vol.Coord. curve on its Equity tab. The script refits the decay and returns the residual at every point, the tenor range your positions actually constrain, and the most extreme volatility the fit produces — a decay that reproduces the curve by pricing a wing at 150% has fitted the chart rather than the market, and it tells you so.
+
+Being **relative** is the part that matters, and it is why the additive slopes were removed from the defaults. Multiplying every volatility by the same factor puts more *points* on a wing already quoted at 41% than on a 31% at-the-money, so the surface steepens by itself. A parallel shift in points cannot do that at any slope, and on a ratio book the difference is not a matter of degree: the additive model made the curve monotonically worse through the region where Risk Navigator turns it back up, and put its crossover around −35% where Risk Navigator puts it near −18%. Measured there, `vol_coord` troughs at roughly **60% of the depth** of the constant-volatility curve and at a **much shallower shock** — so a rising-volatility regime came out as the *better* one, the opposite of what a naive short-vega reading predicts. That is the reason the regimes are returned as separate curves rather than as a band.
+
+**The additive slope alternative is your input, not a measurement.** Neither vol mode moves it: `sticky_strike` pins volatility to the strike and `sticky_moneyness` slides a strike along today's smile, so with both slopes at zero the curve prices the move in the underlying and not the move in volatility that comes with it — the optimistic half of the answer for a net short option book. `vol_slope_down` puts it in, at volatility points per 1% fall. It is applied as a **parallel** shift, flat across tenors, and a real surface does neither: it steepens in a sell-off, which understates a long out-of-the-money put, and the front month moves more than a 120-day tenor. A steepening term was tried and removed — the values that reproduced the observed shape priced the long wings above 100% implied volatility, which is curve fitting rather than modelling.
+
+`stress_curve` exists because of that. Rather than burying one regime in one result, it returns a curve per regime over a single loading of the portfolio and a single surface, so the curves differ by assumption alone — by default the same two Risk Navigator draws. **Read the slope-0 curve first**: it is the constant-volatility case and the only one with an external check against Risk Navigator's blue line — and it passes. Measured against a live index ratio book, `stress_curve` at `vol_mode='sticky_strike'`, slope 0, tracks Risk Navigator's blue curve to within **1-3% at every shock from 0 to −30%**. That check only works in `sticky_strike`, which is why it is the default here; `sticky_moneyness` is a different model and on the same book put the trough 1.8x deeper. And do not assume the steepest slope is the worst case everywhere — on a book holding long wings the ordering reverses in the far tail, where the least-deep long puts carry the most vega and a rising volatility starts helping.
 
 **The local repricing is European; most of these options are American.** Black-76 has no early exercise, while equity options and CME futures options both do. The gap is negligible out of the money and real once an option is in the money. Measured against live IB data: a 75-strike put with spot at 71.94 priced at 4.51 locally against IB's 4.65, a 2.9% shortfall that is the early-exercise premium and nothing else. It is reported per position as `modelVsMarket` rather than hidden, and it means the curve slightly *understates* losses deep in the money.
 
@@ -174,7 +203,7 @@ uv run python scripts/smoke_test.py   # end-to-end, needs TWS
 
 The unit tests run the whole repricing layer against recorded JSON fixtures in `tests/fixtures/`, with the valuation date pinned, so a pricing bug is distinguishable from a market data problem and the numbers do not drift as time passes. The fixture portfolio holds an AM-settled quarterly and a PM-settled weekly on the same morning, a future, an equity and a bond — every trap above, in one file.
 
-`scripts/smoke_test.py` exercises the live path: connection, greeks with a count of any missing `modelGreeks`, a surface, `stress_portfolio` from −30% to +30% in 1% steps with the reconciliation check, `stress_whatif`, and a `whatif_order` on a single deeply out-of-the-money leg. Point `.env` at the paper port to try it safely.
+`scripts/smoke_test.py` exercises the live path: connection, greeks with a count of any missing `modelGreeks`, a surface, `stress_portfolio` from −30% to +30% in 1% steps with the reconciliation check, `stress_curve` over its three default regimes — checking both that the constant-volatility curve starts at zero and that `volSurfaceUsed` is not empty — `stress_whatif`, and a `whatif_order` on a single deeply out-of-the-money leg. Point `.env` at the paper port to try it safely.
 
 ## Layout
 

@@ -5,6 +5,7 @@ remembered number, so the tests survive a change of fixture but not a change
 of behaviour.
 """
 
+import asyncio
 from datetime import date
 
 import pytest
@@ -34,21 +35,31 @@ def curve(units, shocks, **kw):
     kw.setdefault("rate", RATE)
     cfg = S.StressConfig(shocks=shocks, asof=ASOF, **kw)
     cfg.validate()
-    skews = {}
-    if cfg.vol_mode == "sticky_moneyness":
-        # build_skews is async only because it may fetch; the pure path is
-        # rebuilt here so the engine can be exercised synchronously.
-        grouped = {}
-        for u in units:
-            if u.asset_class == "option" and u.priceable:
-                grouped.setdefault(u.skew_key, []).append(u)
-        for key, group in grouped.items():
-            if len({u.strike for u in group}) >= 3:
-                skews[key] = pricing.VolSkew.from_strikes(
-                    group[0].years, group[0].und_price, [u.strike for u in group],
-                    [u.iv for u in group],
-                )
-    return S.run_curve(units, cfg, skews), cfg
+    return S.run_curve(units, cfg, surfaces_for(units, cfg)), cfg
+
+
+def surfaces_for(units, cfg):
+    """build_surfaces is async only because it may fetch; the pure path is
+    rebuilt here so the engine can be exercised synchronously."""
+    if cfg.vol_mode != "sticky_moneyness":
+        return {}
+    grouped = {}
+    for u in units:
+        if u.asset_class == "option" and u.priceable:
+            grouped.setdefault(u.skew_key, []).append(u)
+    surfaces = {}
+    for (symbol, _expiry), group in grouped.items():
+        if len({u.strike for u in group}) < 3:
+            continue
+        surfaces.setdefault(symbol, pricing.VolSurface()).add(
+            pricing.VolSkew.from_strikes(
+                group[0].years,
+                group[0].forward(0.0, group[0].years, cfg.rate),
+                [u.strike for u in group],
+                [u.iv for u in group],
+            )
+        )
+    return surfaces
 
 
 class TestUnitConstruction:
@@ -596,3 +607,542 @@ class TestAssumptions:
         assert a["volMode"] == "sticky_moneyness"
         assert "ACT/365" in a["dayCount"]
         assert "same percentage" in a["underlyingCorrelation"]
+
+
+def option_unit(strike, iv, years, forward, expiry, position=-1.0, symbol="ES"):
+    """A bare option unit, for the surface cases the recorded portfolio cannot
+    reach — it holds every strike it has on a single settlement date, so it
+    cannot exercise the tenor axis at all."""
+    return S.RiskUnit(
+        key=f"{symbol}-{expiry}-{strike:.0f}",
+        label=f"{symbol} {expiry} P{strike:.0f}",
+        symbol=symbol,
+        asset_class="option",
+        position=position,
+        multiplier=50.0,
+        market_value=None,
+        sec_type="FOP",
+        risk_group="equity",
+        und_symbol=symbol,
+        strike=strike,
+        right="P",
+        years=years,
+        iv=iv,
+        und_price=forward,
+        underlying_is_forward=True,
+        skew_key=(symbol, expiry),
+    )
+
+
+@pytest.fixture
+def two_tenor_units():
+    """A full ladder on the front expiry and one lonely strike on the back —
+    the shape a real book usually has, and the one a per-expiry smile cannot
+    handle."""
+    front = [
+        option_unit(5800.0, 0.24, 0.10, 6400.0, "2026-09-18"),
+        option_unit(6100.0, 0.20, 0.10, 6400.0, "2026-09-18"),
+        option_unit(6400.0, 0.17, 0.10, 6400.0, "2026-09-18"),
+    ]
+    back = [option_unit(6000.0, 0.21, 0.60, 6450.0, "2027-03-19")]
+    return front + back
+
+
+def surfaces_of(units, **kw):
+    cfg = S.StressConfig(shocks=[0.0], vol_mode="sticky_moneyness", rate=RATE, **kw)
+    surfaces, warnings = asyncio.run(S.build_surfaces(units, cfg))
+    return surfaces, warnings, cfg
+
+
+class TestVolSurface:
+    """The surface replaced a bag of per-expiry smiles. What it has to buy is
+    the tenor axis; what it must not cost is the curve's zero."""
+
+    def test_the_smile_shift_is_zero_at_zero_shock(self, units):
+        surfaces, _, cfg = surfaces_of(units)
+        for unit in units:
+            if unit.asset_class == "option" and unit.priceable:
+                assert S.smile_shift(unit, 0.0, cfg, surfaces) == pytest.approx(0.0, abs=1e-12)
+
+    def test_the_level_at_zero_shock_is_still_ibs_own_volatility(self, two_tenor_units):
+        """The back-month strike is not a node of any fitted smile, so an
+        absolute lookup would hand it the front month's interpolated value
+        instead of the volatility IB published for it."""
+        surfaces, _, cfg = surfaces_of(two_tenor_units)
+        back = two_tenor_units[-1]
+        assert S.shocked_vol(back, 0.0, cfg, surfaces) == pytest.approx(back.iv)
+
+    def test_sticky_moneyness_still_starts_the_curve_at_exactly_zero(self, units, shocks):
+        rows, _ = curve(units, shocks, vol_mode="sticky_moneyness")
+        at_zero = next(r for r in rows["curve"] if r["shock"] == 0.0)
+        assert at_zero["pnl_total"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_thin_expiry_borrows_its_shape_from_another_tenor(self, two_tenor_units):
+        """One strike defines no slope of its own, so on its own expiry it
+        cannot move at all. Read off the surface it does: the front month's
+        smile carries across in total variance.
+
+        The sign is downwards, and that is the model rather than a surprise.
+        A 6000 put sits below a 6450 forward today and above a 5160 one after
+        the shock, so under sticky moneyness it stops being a wing and picks up
+        the low volatility that belongs at the money. This is exactly what
+        sticky_strike refuses to do, and why it is the conservative mode.
+        """
+        surfaces, _, cfg = surfaces_of(two_tenor_units)
+        back = two_tenor_units[-1]
+        assert S.smile_shift(back, -0.20, cfg, surfaces) < 0.0
+        assert S.smile_shift(back, -0.20, cfg, {}) == 0.0
+
+    def test_the_borrowed_shape_is_named_in_the_warnings(self, two_tenor_units):
+        _, warnings, _ = surfaces_of(two_tenor_units)
+        assert any("interpolated from the other ES tenors" in w for w in warnings)
+
+    def test_an_underlying_with_no_smile_anywhere_falls_back_and_says_so(self):
+        lonely = [option_unit(6000.0, 0.21, 0.60, 6450.0, "2027-03-19")]
+        surfaces, warnings, cfg = surfaces_of(lonely)
+        assert surfaces == {}
+        assert any("repriced sticky_strike" in w for w in warnings)
+        assert S.shocked_vol(lonely[0], -0.20, cfg, surfaces) == pytest.approx(lonely[0].iv)
+
+    def test_an_empty_surface_prices_exactly_like_sticky_strike(self, units, shocks):
+        strike_mode, _ = curve(units, shocks, vol_mode="sticky_strike")
+        cfg = S.StressConfig(
+            shocks=shocks, vol_mode="sticky_moneyness", rate=RATE, asof=ASOF
+        )
+        with_nothing = S.run_curve(units, cfg, {})
+        assert [r["pnl_total"] for r in with_nothing["curve"]] == [
+            r["pnl_total"] for r in strike_mode["curve"]
+        ]
+
+    def test_the_report_lists_the_quotes_that_were_read(self, units):
+        surfaces, _, _ = surfaces_of(units)
+        rows = S.surface_report(surfaces)
+        assert rows and all(r["underlying"] == "ES" for r in rows)
+        quoted = {round(p["strike"]) for r in rows for p in r["points"]}
+        assert quoted == {5500, 5800, 6100}
+
+    def test_the_report_is_empty_when_no_surface_was_built(self, units):
+        assert S.surface_report({}) == []
+
+    def test_sticky_strike_builds_no_surface_at_all(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_mode="sticky_strike", rate=RATE)
+        surfaces, warnings = asyncio.run(S.build_surfaces(units, cfg))
+        assert surfaces == {} and warnings == []
+
+
+class TestVolScenarios:
+    def test_the_default_set_opens_with_a_constant_volatility_curve(self):
+        first = S.DEFAULT_VOL_SCENARIOS[0]
+        assert (first.vol_slope_down, first.vol_slope_up, first.vol_coord) == (0.0, 0.0, False)
+
+    def test_the_default_set_is_the_two_curves_risk_navigator_draws(self):
+        """Nothing invented on top: the constant-volatility case and IB's own
+        Vol.Coord. model. The additive slopes that used to ship as defaults were
+        guesses, and on a ratio book they had the wrong shape as well as the
+        wrong size."""
+        assert [s.name for s in S.DEFAULT_VOL_SCENARIOS] == ["const", "vol_coord"]
+        assert S.DEFAULT_VOL_SCENARIOS[1].vol_coord is True
+
+    def test_the_default_shocks_reach_forty_percent_down(self):
+        assert min(S.DEFAULT_SHOCKS) == pytest.approx(-0.40)
+        assert max(S.DEFAULT_SHOCKS) == pytest.approx(0.10)
+        assert S.DEFAULT_SHOCKS == tuple(sorted(S.DEFAULT_SHOCKS))
+
+    def test_a_scenario_only_touches_the_volatility_terms(self):
+        overrides = S.VolScenario("stress", vol_slope_down=1.4, vol_slope_up=0.7).overrides()
+        assert set(overrides) == {"vol_slope_down", "vol_slope_up", "vol_bump", "vol_coord"}
+
+    def test_two_scenarios_differ_only_by_their_slope(self, units, shocks):
+        const, _ = curve(units, shocks, vol_slope_down=0.0)
+        stressed, _ = curve(units, shocks, vol_slope_down=1.4)
+        at_zero = [c["curve"][len(shocks) // 2] for c in (const, stressed)]
+        assert at_zero[0]["shock"] == at_zero[1]["shock"]
+        worst = [min(r["pnl_total"] for r in c["curve"]) for c in (const, stressed)]
+        assert worst[1] < worst[0]
+
+
+
+class TestVolCoord:
+    """IB's volatility-coordinated model. The asymmetry is documented by IB; the
+    term damping is this server's fit, and both are stated as such in the
+    output."""
+
+    @pytest.fixture
+    def cfg(self):
+        return S.StressConfig(shocks=[0.0], vol_coord=True, rate=RATE)
+
+    def test_nothing_moves_at_zero_shock(self, cfg, units):
+        assert S.vol_coord_factor(0.0, 0.3, cfg) == pytest.approx(1.0)
+        for u in units:
+            if u.asset_class == "option" and u.priceable:
+                assert S.shocked_vol(u, 0.0, cfg, {}) == pytest.approx(u.iv)
+
+    def test_the_curve_still_starts_at_exactly_zero(self, units, shocks):
+        rows, _ = curve(units, shocks, vol_coord=True)
+        at_zero = next(r for r in rows["curve"] if r["shock"] == 0.0)
+        assert at_zero["pnl_total"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_fall_moves_volatility_ten_times_as_hard_as_a_rise(self, cfg):
+        up = S.vol_coord_factor(+0.10, 0.0, cfg) - 1.0
+        down = S.vol_coord_factor(-0.10, 0.0, cfg) - 1.0
+        assert down == pytest.approx(-10.0 * up)
+
+    def test_it_is_relative_so_the_surface_steepens_on_its_own(self, cfg):
+        """The whole reason this model exists. One multiplier, applied to a wing
+        already quoted at 41% and to a 31% at the money, puts half again as many
+        *points* on the wing. No additive slope reproduces that at any value,
+        which is what made the parallel shift the wrong shape rather than merely
+        the wrong size."""
+        factor = S.vol_coord_factor(-0.20, 0.30, cfg)
+        atm_points = 0.31 * (factor - 1.0)
+        wing_points = 0.41 * (factor - 1.0)
+        assert wing_points > atm_points
+        assert wing_points / atm_points == pytest.approx(0.41 / 0.31)
+
+    def test_a_longer_tenor_takes_less_of_the_shock(self, cfg):
+        front = S.vol_coord_factor(-0.20, 0.05, cfg)
+        back = S.vol_coord_factor(-0.20, 0.60, cfg)
+        assert 1.0 < back < front
+        # Undamped, a 20% fall would triple every volatility on the board.
+        assert S.vol_coord_factor(-0.20, 0.0, cfg) == pytest.approx(3.0)
+
+    def test_the_damping_is_what_keeps_a_back_month_plausible(self, cfg):
+        """A six-month contract at 31% must not come back at 93%."""
+        assert 0.31 * S.vol_coord_factor(-0.20, 0.5, cfg) < 0.55
+
+    def test_a_rally_cannot_drive_volatility_negative(self, cfg):
+        assert S.vol_coord_factor(+3.0, 0.0, cfg) >= 0.0
+
+    def test_it_replaces_the_additive_slopes_rather_than_stacking(self, units):
+        opt = next(u for u in units if u.asset_class == "option" and u.priceable)
+        both = S.StressConfig(shocks=[0.0], vol_coord=True, vol_slope_down=1.4, rate=RATE)
+        coord_only = S.StressConfig(shocks=[0.0], vol_coord=True, rate=RATE)
+        assert S.shocked_vol(opt, -0.20, both, {}) == pytest.approx(
+            S.shocked_vol(opt, -0.20, coord_only, {})
+        )
+
+    def test_a_vol_bump_still_lands_on_top(self, units):
+        opt = next(u for u in units if u.asset_class == "option" and u.priceable)
+        plain = S.StressConfig(shocks=[0.0], vol_coord=True, rate=RATE)
+        bumped = S.StressConfig(shocks=[0.0], vol_coord=True, vol_bump=0.05, rate=RATE)
+        assert S.shocked_vol(opt, -0.20, bumped, {}) == pytest.approx(
+            S.shocked_vol(opt, -0.20, plain, {}) + 0.05
+        )
+
+    def test_the_model_is_spelled_out_in_the_assumptions(self):
+        on = S.assumptions(S.StressConfig(shocks=[0.0], vol_coord=True))
+        assert on["volCoord"] is True
+        assert "not published by IB" in on["volCoordModel"]
+        off = S.assumptions(S.StressConfig(shocks=[0.0]))
+        assert off["volCoord"] is False
+        assert off["volCoordModel"] is None
+
+class TestCurvePoints:
+    def test_a_point_carries_the_shocked_underlying_and_the_fraction_of_nlv(self):
+        rows = [
+            {
+                "shock": -0.20,
+                "pnl_total": -43000.0,
+                "pnl_by_asset_class": {},
+                "pnl_by_symbol": {},
+            }
+        ]
+        point = S.curve_points(rows, spot=7030.0, net_liquidation=500_000.0)[0]
+        assert point["shock_pct"] == pytest.approx(-20.0)
+        assert point["underlying"] == pytest.approx(7030.0 * 0.80)
+        assert point["pnl_pct_of_nlv"] == pytest.approx(-0.086)
+        assert point["portfolio_value"] == pytest.approx(457_000.0)
+
+    def test_the_fraction_is_omitted_rather_than_assumed(self):
+        rows = [
+            {"shock": 0.0, "pnl_total": 0.0, "pnl_by_asset_class": {}, "pnl_by_symbol": {}}
+        ]
+        point = S.curve_points(rows, spot=None, net_liquidation=None)[0]
+        assert "pnl_pct_of_nlv" not in point
+        assert "portfolio_value" not in point
+        assert "underlying" not in point
+
+
+class TestReferenceUnderlying:
+    def test_it_names_the_heaviest_in_scope_exposure(self, units):
+        cfg = S.StressConfig(shocks=[0.0], rate=RATE)
+        ref = S.reference_underlying(units, cfg)
+        assert ref["symbol"] == "ES"
+        assert ref["spot"] == pytest.approx(6412.5)
+
+    def test_an_off_axis_underlying_cannot_become_the_reference(self, fx_unit):
+        """A lone CAD option is the only position there is, and it is still not
+        the label for an equity axis — there is nothing to label."""
+        cfg = S.StressConfig(shocks=[0.0], rate=RATE)
+        assert S.reference_underlying([fx_unit], cfg) is None
+        assert S.reference_underlying([fx_unit], S.StressConfig(shocks=[0.0], scope="all"))[
+            "symbol"
+        ] == "CAD"
+
+    def test_nothing_priceable_gives_no_reference(self):
+        assert S.reference_underlying([], S.StressConfig(shocks=[0.0])) is None
+
+
+class TestScopeWarningsSwitch:
+    def test_the_volatility_sentence_can_be_left_to_the_caller(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_slope_down=1.0)
+        with_vol = S.scope_warnings(units, cfg)
+        without = S.scope_warnings(units, cfg, include_vol=False)
+        assert any("Implied volatility responds" in w for w in with_vol)
+        assert not any("Implied volatility responds" in w for w in without)
+        assert len(without) == len(with_vol) - 1
+
+
+@pytest.fixture
+def offline(monkeypatch, holdings, fake_ib):
+    """The whole tool without TWS: the recorded portfolio stands in for the
+    account, and everything else runs for real."""
+
+    async def fake_get():
+        return fake_ib
+
+    async def fake_load(with_greeks=True, symbol=None):
+        return holdings
+
+    monkeypatch.setattr(S.connection, "get", fake_get)
+    monkeypatch.setattr(S.connection, "require_account", lambda: "DU1234567")
+    monkeypatch.setattr(S.MD, "load_holdings", fake_load)
+    return fake_ib
+
+
+def run_stress_curve(scenarios=None, **kw):
+    kw.setdefault("rate", RATE)
+    kw.setdefault("asof", ASOF)
+    kw.setdefault("shocks", list(S.DEFAULT_SHOCKS))
+    kw.setdefault("vol_mode", "sticky_moneyness")
+    cfg = S.StressConfig(**kw)
+    if scenarios is None:
+        scenarios = list(S.DEFAULT_VOL_SCENARIOS)
+    return asyncio.run(S.stress_curve(cfg, scenarios))
+
+
+class TestStressCurve:
+    def test_one_curve_per_scenario_over_one_shock_axis(self, offline):
+        out = run_stress_curve()
+        assert [c["name"] for c in out["curves"]] == ["const", "vol_coord"]
+        assert all(len(c["points"]) == len(S.DEFAULT_SHOCKS) for c in out["curves"])
+        axes = {tuple(p["shock"] for p in c["points"]) for c in out["curves"]}
+        assert len(axes) == 1
+
+    def test_the_constant_volatility_curve_starts_at_exactly_zero(self, offline):
+        """The one curve with an external check. If this does not sit on Risk
+        Navigator's blue line the volatility lookup is wrong, and nothing else
+        in the result is worth reading."""
+        const = run_stress_curve()["curves"][0]
+        at_zero = next(p for p in const["points"] if p["shock"] == 0.0)
+        assert const["volSlopeDown"] == 0.0
+        assert at_zero["pnl"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_steeper_slope_costs_more_where_the_book_is_short_vega(self, offline):
+        out = run_stress_curve(
+            [S.VolScenario("a"), S.VolScenario("b", vol_slope_down=0.7),
+             S.VolScenario("c", vol_slope_down=1.4)]
+        )
+        at_ten_down = [
+            next(p["pnl"] for p in c["points"] if p["shock"] == pytest.approx(-0.10))
+            for c in out["curves"]
+        ]
+        assert at_ten_down == sorted(at_ten_down, reverse=True)
+
+    def test_the_ordering_reverses_in_the_far_tail_and_that_is_the_point(self, offline):
+        """Deep enough down, the long 5500 puts are the least far in the money
+        and carry the most vega of anything in the book, so a rising volatility
+        starts *helping*. `moderate` ends up above `const` at -30%.
+
+        This is why the regimes are returned as separate curves rather than
+        collapsed into a band: which one is worst depends on where you are on
+        the axis, and a reader who assumes the steepest slope is the worst case
+        everywhere will read the tail backwards.
+        """
+        out = run_stress_curve(
+            [S.VolScenario("const"), S.VolScenario("moderate", vol_slope_down=0.7)]
+        )
+        by_name = {c["name"]: c for c in out["curves"]}
+
+        def pnl(name, shock):
+            return next(
+                p["pnl"] for p in by_name[name]["points"] if p["shock"] == pytest.approx(shock)
+            )
+
+        assert pnl("moderate", -0.10) < pnl("const", -0.10)
+        assert pnl("moderate", -0.30) > pnl("const", -0.30)
+
+    def test_every_point_carries_its_fraction_of_the_account(self, offline):
+        out = run_stress_curve()
+        assert out["netLiquidation"] > 0
+        point = out["curves"][0]["points"][0]
+        assert point["pnl_pct_of_nlv"] == pytest.approx(
+            point["pnl"] / out["netLiquidation"], rel=1e-6
+        )
+        assert point["underlying"] == pytest.approx(6412.5 * (1.0 + point["shock"]))
+
+    def test_the_surface_it_read_is_reported(self, offline):
+        """The acceptance criterion: an empty surface under sticky_moneyness
+        means every option quietly fell back to sticky_strike."""
+        out = run_stress_curve()
+        assert out["volSurfaceUsed"]
+        assert {p["strike"] for r in out["volSurfaceUsed"] for p in r["points"]} == {
+            5500.0,
+            5800.0,
+            6100.0,
+        }
+
+    def test_an_empty_surface_is_called_out_rather_than_left_to_be_noticed(self, offline):
+        out = run_stress_curve(vol_mode="sticky_moneyness", shocks=[-0.1, 0.0])
+        assert out["volSurfaceUsed"]
+        empty = run_stress_curve(vol_mode="sticky_strike")
+        assert empty["volSurfaceUsed"] == []
+
+    def test_the_off_axis_position_is_named_and_valued(self, offline):
+        out = run_stress_curve()
+        assert any(row["riskGroup"] == "rates" for row in out["excluded"])
+        assert any("kept only equity underlyings" in w for w in out["warnings"])
+
+    def test_the_slope_is_flagged_as_an_input_once_not_per_curve(self, offline):
+        out = run_stress_curve([S.VolScenario("a"), S.VolScenario("b", vol_slope_down=0.7)])
+        slope_notes = [w for w in out["warnings"] if "additive volatility slope" in w]
+        assert len(slope_notes) == 1
+        assert not any("Implied volatility responds" in w for w in out["warnings"])
+
+    def test_the_parallel_shift_caveat_stays_off_a_run_that_has_no_slope(self, offline):
+        """It described a parallel shift flat across tenors on a run whose only
+        model was vol_coord — relative, and damped by tenor. A warning that
+        contradicts the model in use is worse than none."""
+        out = run_stress_curve()
+        assert not any("parallel shift" in w for w in out["warnings"])
+        assert not any("flat across tenors" in w for w in out["warnings"])
+        assert any("which is worst depends on where you are on the axis" in w
+                   for w in out["warnings"])
+
+    def test_the_assumptions_do_not_claim_a_single_volatility_slope(self, offline):
+        """`assumptions` describes one config and there are three here. Leaving
+        the base config's zeros in place would read as "volatility is held
+        constant" on the one result whose whole point is that it is not."""
+        out = run_stress_curve()
+        assumed = out["assumptions"]
+        assert "volSlopeDown" not in assumed
+        assert "varies by curve" in assumed["volatilityLevel"]
+        assert [s["name"] for s in assumed["volScenarios"]] == ["const", "vol_coord"]
+        assert assumed["volMode"] == "sticky_moneyness"
+
+    def test_the_reference_underlying_is_named(self, offline):
+        out = run_stress_curve()
+        assert out["underlying"] == {"symbol": "ES", "spot": 6412.5}
+
+    def test_it_reconciles_against_the_recorded_account(self, offline):
+        assert run_stress_curve()["reconciled"] is True
+
+    def test_duplicate_scenario_names_are_rejected(self, offline):
+        with pytest.raises(ValueError, match="unique"):
+            run_stress_curve([S.VolScenario("a"), S.VolScenario("a", vol_slope_down=1.0)])
+
+    def test_no_scenarios_is_rejected(self, offline):
+        with pytest.raises(ValueError, match="at least one"):
+            run_stress_curve([])
+
+    def test_a_scenario_slope_in_the_wrong_units_is_caught(self, offline):
+        with pytest.raises(ValueError, match="volatility points"):
+            run_stress_curve([S.VolScenario("percent", vol_slope_down=100.0)])
+
+
+class TestVolCoordProvenance:
+    """The decay is a fit, not a published number, and it was fitted on a book
+    that held nothing past four months. Both facts have to reach the reader at
+    runtime — `assumptions` is where you look once you already suspect
+    something."""
+
+    def test_the_factory_decay_announces_itself_as_a_fit(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_coord=True)
+        assert cfg.vol_coord_decay == S.DEFAULT_VOL_COORD_DECAY
+        out = S.vol_coord_warnings(units, cfg)
+        assert any("factory decay" in w and "read off a chart by eye" in w for w in out)
+
+    def test_a_recalibrated_decay_does_not(self, units):
+        cfg = S.StressConfig(shocks=[0.0], vol_coord=True, vol_coord_decay=3.1)
+        assert not any("factory decay" in w for w in S.vol_coord_warnings(units, cfg))
+
+    def test_a_position_past_the_calibration_is_named(self, units):
+        """The fixture's ES options sit inside the calibrated range, so nothing
+        fires until the range is pulled in under them — which is the same thing
+        that happens to a real book holding a LEAPS."""
+        cfg = S.StressConfig(shocks=[0.0], vol_coord=True, vol_coord_calibrated_to_years=0.1)
+        out = S.vol_coord_warnings(units, cfg)
+        assert any("beyond 0.10 years" in w for w in out)
+        assert any("understates the risk of anything long-dated" in w for w in out)
+
+    def test_nothing_fires_when_every_tenor_is_covered(self, units):
+        cfg = S.StressConfig(
+            shocks=[0.0], vol_coord=True, vol_coord_decay=3.1,
+            vol_coord_calibrated_to_years=10.0,
+        )
+        assert S.vol_coord_warnings(units, cfg) == []
+
+    def test_the_extrapolation_it_warns_about_is_real(self):
+        """An exponential does not merely lose accuracy past its fit, it decays
+        to nothing: a one-year option would be repriced as though a 20% crash
+        barely moved its volatility. That is the reason the warning exists and
+        the reason a floor on VR would be the wrong fix — it would hide it."""
+        cfg = S.StressConfig(shocks=[0.0], vol_coord=True)
+        assert S.vol_coord_factor(-0.20, 0.25, cfg) > 1.5
+        assert S.vol_coord_factor(-0.20, 1.0, cfg) < 1.02
+
+    def test_the_curve_carries_the_warning(self, offline):
+        out = run_stress_curve()
+        assert any("factory decay" in w for w in out["warnings"])
+
+    def test_a_curve_without_vol_coord_is_not_lectured_about_it(self, offline):
+        out = run_stress_curve([S.VolScenario("const")])
+        assert not any("factory decay" in w for w in out["warnings"])
+
+
+class TestCalibrateVolCoord:
+    """The point of the calibration entry point is that the decay stops being a
+    constant somebody once fitted."""
+
+    @pytest.fixture
+    def cfg(self):
+        return S.StressConfig(shocks=[0.0], scope="equity", asof=ASOF, rate=RATE)
+
+    def targets_from(self, units, cfg, decay, shocks):
+        """A curve this engine produced at a known decay, used as the thing to
+        recover. If the fit cannot find a decay it generated itself, it will
+        certainly not find one Risk Navigator generated."""
+        known = S.replace(cfg, vol_coord=True, vol_coord_decay=decay, shocks=shocks)
+        rows = S.run_curve(units, known, {})["curve"]
+        return {r["shock"]: r["pnl_total"] for r in rows}
+
+    def test_it_recovers_a_decay_it_was_given(self, units, cfg):
+        shocks = [-0.25, -0.20, -0.15, -0.10, -0.05]
+        out = S.calibrate_vol_coord(units, cfg, self.targets_from(units, cfg, 2.5, shocks))
+        assert out["decay"] == pytest.approx(2.5, abs=0.05)
+        assert out["rms"] < 1.0
+
+    def test_every_point_comes_back_with_its_residual(self, units, cfg):
+        shocks = [-0.20, -0.15, -0.10, -0.05]
+        out = S.calibrate_vol_coord(units, cfg, self.targets_from(units, cfg, 3.0, shocks))
+        assert [p["shock"] for p in out["points"]] == sorted(shocks)
+        assert all("target" in p and "model" in p and "residual" in p for p in out["points"])
+
+    def test_it_reports_the_tenors_the_targets_actually_constrain(self, units, cfg):
+        shocks = [-0.20, -0.15, -0.10, -0.05]
+        out = S.calibrate_vol_coord(units, cfg, self.targets_from(units, cfg, 3.0, shocks))
+        assert out["calibratedToYears"] == pytest.approx(
+            max(u.years for u in units if u.asset_class == "option" and u.priceable), abs=1e-3
+        )
+        assert any("extrapolation" in w for w in out["warnings"])
+
+    def test_it_shows_the_most_extreme_volatility_the_fit_produces(self, units, cfg):
+        shocks = [-0.25, -0.20, -0.15, -0.10]
+        out = S.calibrate_vol_coord(units, cfg, self.targets_from(units, cfg, 3.0, shocks))
+        extreme = out["mostExtremeVol"]
+        assert extreme["atShock"] == pytest.approx(-0.25)
+        assert extreme["impliedVolAfter"] > extreme["impliedVolBefore"]
+
+    def test_too_few_points_is_refused_rather_than_fitted(self, units, cfg):
+        with pytest.raises(ValueError, match="three points"):
+            S.calibrate_vol_coord(units, cfg, {-0.20: -28000.0, -0.10: -22000.0})

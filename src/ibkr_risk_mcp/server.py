@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal, Sequence
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from . import marketdata as MD
 from . import stress as S
@@ -494,6 +494,213 @@ async def stress_portfolio(
         risk_groups,
     )
     return await S.stress_portfolio(cfg)
+
+
+class VolScenarioSpec(BaseModel):
+    """One volatility regime for :func:`stress_curve`."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(description="Label for this curve, e.g. 'const' or 'stress'.")
+    vol_slope_down: float = Field(
+        default=0.0,
+        validation_alias=AliasChoices("vol_slope_down", "beta"),
+        description="Volatility points added per 1% FALL in the underlying. 0 is the "
+        "constant-volatility curve — Risk Navigator's blue line. 1.0 puts a -20% shock "
+        "at +20 points. Accepted as `beta` too.",
+    )
+    vol_slope_up: float = Field(
+        default=0.0,
+        description="Volatility points removed per 1% RISE. Positive means volatility "
+        "falls into a rally, which is the usual direction. Separate because the response "
+        "is not symmetric.",
+    )
+    vol_bump: float = Field(
+        default=0.0,
+        description="Flat shift of the whole surface for this regime, in points, at every "
+        "shock including zero. Unlike the slopes this moves P&L at zero shock, so a "
+        "scenario using it does not start its curve at zero.",
+    )
+    vol_coord: bool = Field(
+        default=False,
+        description="Use IB's own volatility-coordinated model for this curve — the one "
+        "Risk Navigator labels 'Vol.Coord.' — instead of the additive slopes, which it "
+        "then ignores. Volatility is multiplied rather than shifted: a fall of X moves it "
+        "by 10X relatively and a rise by -X, damped across tenors. Because it is "
+        "relative, a wing already quoted high picks up more points than the money and the "
+        "surface steepens on its own — which an additive slope cannot do at any value.",
+    )
+
+
+@tool()
+async def stress_curve(
+    shocks: list[float] | None = Field(
+        default=None,
+        description="Underlying moves as fractions: -0.20 is a 20% fall. Defaults to "
+        "-0.40 to +0.10 in 2% steps, which is wide enough on the downside that a "
+        "short-gamma trough falls inside the window rather than on its edge.",
+    ),
+    vol_scenarios: list[VolScenarioSpec] | None = Field(
+        default=None,
+        description="One curve per volatility regime. Defaults to the two curves Risk "
+        "Navigator itself draws: 'const' (no volatility response, its blue line) and "
+        "'vol_coord' (IB's own volatility-coordinated model). Always keep a const curve "
+        "in the set — it is the one that can be checked against Risk Navigator, and if it "
+        "does not line up nothing else in the result is worth reading. Additive slopes "
+        "are still there for a regime you want to state by hand, but prefer vol_coord: a "
+        "slope shifts the surface in parallel, which on a book that is short the middle "
+        "and long both wings is the wrong shape and not merely the wrong size.",
+    ),
+    vol_mode: Literal["sticky_strike", "sticky_moneyness"] = Field(
+        default="sticky_strike",
+        description="sticky_strike — the default — pins each strike to the volatility it "
+        "holds today. This is what Risk Navigator's blue curve does, and it is the only "
+        "setting under which the slope-0 curve can be checked against it: measured on a "
+        "live index ratio book the two agree to within 1-3% at every shock from 0 to "
+        "-30%. sticky_moneyness instead rereads each strike's volatility at the moneyness "
+        "it lands on after the shock, off the portfolio's own surface, interpolated across "
+        "strike and expiry — a defensible model, but a different one, and on that same "
+        "book it deepened the trough by a factor of 1.8. Do not compare it to Risk "
+        "Navigator.",
+    ),
+    scope: Literal["equity", "all"] = Field(
+        default="equity",
+        description="Which underlyings are on the shock axis. 'equity' excludes FX, rates "
+        "and the rest outright and lists them under `excluded`; 'all' shocks everything "
+        "by the same percentage, which off the equity axis is meaningless.",
+    ),
+    risk_groups: dict[str, str] | None = Field(
+        default=None,
+        description="Override a symbol's risk group, e.g. {'TLT': 'rates'}. IB publishes "
+        "no asset class for a bond or gold ETF quoted as a stock.",
+    ),
+    betas: dict[str, float] | None = Field(
+        default=None,
+        description="Per-symbol share of the PRICE shock — unrelated to a scenario's "
+        "volatility slope. Scales the move of that position's own underlying, options "
+        "and futures included.",
+    ),
+    default_beta: float = 1.0,
+    date_offset_days: int = Field(
+        default=0, description="Roll the valuation date forward this many days (time decay)."
+    ),
+    vol_coord_decay: float = Field(
+        default=4.736,
+        description="Term damping of the vol_coord model: VR(t) = exp(-decay * t), so a "
+        "front-month contract takes nearly the whole shock and a back month a fraction. "
+        "IB documents that this function exists and is decreasing but not what it is, so "
+        "the default is FITTED, not published — it reproduces a live Risk Navigator "
+        "Vol.Coord. curve to an RMS of roughly 3% of the curve's own depth. It is one "
+        "number calibrated on one book; refit it against your own Risk Navigator with "
+        "scripts/calibrate_vol_coord.py before trusting it on another.",
+    ),
+    vol_coord_calibrated_to_years: float = Field(
+        default=0.345,
+        description="How far out in tenor `vol_coord_decay` was actually constrained. "
+        "The shipped decay was fitted on a book holding nothing past four months, and an "
+        "exponential extrapolates to zero — which would price a one-year option as "
+        "carrying no volatility risk at all in a crash. Positions past this are priced "
+        "anyway and named in `warnings`, so the extrapolation is never silent. Raise it "
+        "only after refitting against targets that actually reach that far.",
+    ),
+    bond_rate_shift_bp: float = 0.0,
+    bond_duration_years: float = 5.0,
+    fetch_skew: bool = Field(
+        default=False,
+        description="Let the surface pull neighbouring strikes from IB for expiries the "
+        "portfolio holds too thinly. Costs extra market data requests, and is what to "
+        "reach for when `volSurfaceUsed` comes back thin or empty.",
+    ),
+) -> dict[str, Any]:
+    """The portfolio P&L curve under several volatility regimes at once — the
+    data behind a risk graph, for plotting rather than for reading point by
+    point.
+
+    Risk Navigator draws two curves: a constant-volatility line and one from its
+    own implied-volatility model, which is not documented and cannot be
+    reproduced. This returns as many as you ask for, and the volatility
+    assumption behind each is a number in the output rather than a black box:
+    `volSlopeDown` is volatility points per 1% fall.
+
+    **Read the slope-0 curve first.** It is the constant-volatility case and the
+    only one with an external check — it should sit close to Risk Navigator's
+    blue line. If it does not, the volatility lookup is wrong and no other
+    scenario in the result means anything.
+
+    **Check `volSurfaceUsed`.** It lists every quote the repricing actually
+    read, as (underlying, tenor, strike, iv). Empty under `sticky_moneyness`
+    means no expiry held three strikes, so no smile could be built and every
+    option silently fell back to sticky_strike — the result looks perfectly
+    normal and is not the model you asked for. `fetch_skew=true` fixes it at the
+    cost of extra market data requests.
+
+    How each curve is built, and where it is weakest:
+
+    - Every scenario reprices **one** loading of the portfolio and **one**
+      surface, so the curves differ by assumption alone. Calling the
+      single-curve tool three times could not promise that: the book moves
+      between calls.
+    - The starting volatility is IB's own, per contract, out of a model that
+      prices American exercise. The surface is used only for the *change* in
+      volatility as a strike slides to new moneyness, which keeps IB's better
+      number as the anchor and keeps every curve exactly zero at zero shock.
+    - `vol_coord` reproduces IB's own model: volatility is **multiplied**, not
+      shifted — a fall of X moves it by 10X relatively, a rise by -X, damped
+      across tenors. Being relative is what makes the surface steepen by
+      itself, since a wing already quoted at 41% takes more points than a 31%
+      at-the-money out of the same scenario. The asymmetry is IB's documented
+      one; the damping is fitted here and is not published, so `vol_coord_decay`
+      is an input you should refit against your own Risk Navigator.
+    - The additive `volSlopeDown` alternative is a **parallel** shift, flat
+      across tenors. It cannot steepen at any value, and on a ratio book that
+      is the difference between a curve that keeps falling and one that turns
+      back up. Prefer `vol_coord` unless you specifically want a flat regime.
+    - Equities move by the shock times their beta, futures and options by their
+      own underlying's beta-scaled move. Bonds are flat unless
+      `bond_rate_shift_bp` is set. FX is off the axis by default and reported
+      under `excluded` with its market value — not held flat in silence.
+    - Options IB would not model are repriced from a locally implied volatility
+      where a mark price exists, flagged per position and in `warnings`, and
+      held flat only when even that fails.
+
+    `pnl_pct_of_nlv` is on every point, and `netLiquidation` at the top. Quote
+    the fraction rather than the amount when comparing two dates or two
+    accounts. **Check `reconciled` before quoting any of it.**
+    """
+    cfg = _stress_config(
+        list(shocks) if shocks else list(S.DEFAULT_SHOCKS),
+        vol_mode,
+        0.0,
+        0.0,
+        0.0,
+        date_offset_days,
+        betas,
+        default_beta,
+        bond_rate_shift_bp,
+        bond_duration_years,
+        fetch_skew,
+        scope,
+        risk_groups,
+    )
+    if vol_scenarios is None:
+        scenarios = list(S.DEFAULT_VOL_SCENARIOS)
+    else:
+        # An empty list is not a request for the defaults, it is a caller
+        # mistake, and stress_curve says so rather than quietly substituting a
+        # set of scenarios nobody asked for.
+        scenarios = [
+            S.VolScenario(
+                name=v.name,
+                vol_slope_down=v.vol_slope_down,
+                vol_slope_up=v.vol_slope_up,
+                vol_bump=v.vol_bump,
+                vol_coord=v.vol_coord,
+            )
+            for v in vol_scenarios
+        ]
+    cfg.vol_coord_decay = vol_coord_decay
+    cfg.vol_coord_calibrated_to_years = vol_coord_calibrated_to_years
+    return await S.stress_curve(cfg, scenarios)
 
 
 @tool()
