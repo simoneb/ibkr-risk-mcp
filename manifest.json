@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "ibkr-risk-mcp",
   "display_name": "IBKR Risk (TWS)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Model greeks, IB's volatility surface, what-if margin, and portfolio stress curves from Interactive Brokers.",
   "long_description": "Fills the gap the official IBKR connector leaves: portfolio risk. Pulls IB's own model greeks and implied volatility surface out of TWS, asks IB's margin engine what a hypothetical structure would cost, and rebuilds the P&L-versus-underlying curve locally so you can ask where the trough sits and where a new option position would move it. TWS or IB Gateway must be running on this machine with the API enabled — the extension talks to its local socket, never to IBKR over the internet. It is read-only: the only tool that touches the order path sends whatIf=True orders that IB evaluates and discards, and it stays inert unless you enable it below.",
   "author": {
