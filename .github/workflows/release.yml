@@ -88,13 +88,36 @@ jobs:
           current = re.search(r'^version = "(.+?)"', text, re.M).group(1)
 
           # The bundle manifest carries its own version, and Claude Desktop shows
-          # that one. Two places to keep in step, so neither is edited by hand.
+          # that one. Three places to keep in step, so none is edited by hand.
           manifest = pathlib.Path("manifest.json")
           manifest_text = manifest.read_text(encoding="utf-8")
           manifest_version = re.search(r'"version": "(.+?)"', manifest_text).group(1)
           if manifest_version != current:
               raise SystemExit(
                   f"::error::manifest.json is {manifest_version} but pyproject is {current}"
+              )
+
+          # The third is the lock's entry for the project itself. It is not a
+          # dependency, so a stale one resolves nothing differently and breaks
+          # no build — which is exactly why it drifted through two releases
+          # unnoticed. A lock that disagrees with its own manifest still cannot
+          # be read to answer what was released.
+          #
+          # Rewritten textually rather than by running `uv lock`, deliberately.
+          # Re-resolving here would let dependency versions move inside a
+          # release commit that nobody reviews, turning a version bump into an
+          # unreviewed upgrade. Only the project's own line is touched.
+          lock = pathlib.Path("uv.lock")
+          lock_text = lock.read_text(encoding="utf-8")
+          lock_entry = re.compile(
+              r'(name = "ibkr-risk-mcp"\r?\nversion = ")(.+?)(")'
+          )
+          found = lock_entry.search(lock_text)
+          if not found:
+              raise SystemExit("::error::no ibkr-risk-mcp entry found in uv.lock")
+          if found.group(2) != current:
+              raise SystemExit(
+                  f"::error::uv.lock is {found.group(2)} but pyproject is {current}"
               )
 
           if os.environ["EVENT"] == "push":
@@ -140,6 +163,10 @@ jobs:
           )
           manifest.write_text(
               manifest_text.replace(f'"version": "{current}"', f'"version": "{version}"', 1),
+              encoding="utf-8",
+          )
+          lock.write_text(
+              lock_entry.sub(lambda m: m.group(1) + version + m.group(3), lock_text, count=1),
               encoding="utf-8",
           )
 
