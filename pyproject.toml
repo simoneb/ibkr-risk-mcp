@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ibkr-risk-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server exposing Interactive Brokers portfolio risk: model greeks, IB's volatility surface, what-if margin, and a local stress engine"
 readme = "README.md"
 requires-python = ">=3.11"
