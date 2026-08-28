@@ -910,7 +910,7 @@ def offline(monkeypatch, holdings, fake_ib):
     return fake_ib
 
 
-def run_stress_curve(scenarios=None, **kw):
+def run_stress_curve(scenarios=None, date_offsets=None, **kw):
     kw.setdefault("rate", RATE)
     kw.setdefault("asof", ASOF)
     kw.setdefault("shocks", list(S.DEFAULT_SHOCKS))
@@ -918,7 +918,7 @@ def run_stress_curve(scenarios=None, **kw):
     cfg = S.StressConfig(**kw)
     if scenarios is None:
         scenarios = list(S.DEFAULT_VOL_SCENARIOS)
-    return asyncio.run(S.stress_curve(cfg, scenarios))
+    return asyncio.run(S.stress_curve(cfg, scenarios, date_offsets))
 
 
 class TestStressCurve:
@@ -1146,3 +1146,261 @@ class TestCalibrateVolCoord:
     def test_too_few_points_is_refused_rather_than_fitted(self, units, cfg):
         with pytest.raises(ValueError, match="three points"):
             S.calibrate_vol_coord(units, cfg, {-0.20: -28000.0, -0.10: -22000.0})
+
+
+def expiry_unit(label, expiry, strike, position, *, iv=0.22, years=None, right="P"):
+    """A synthetic ES option on a stated expiry.
+
+    The recorded portfolio settles all three of its options on one morning,
+    which is the right fixture for the skew buckets and the wrong one for a
+    breakdown whose entire purpose is telling expiries apart.
+    """
+    settles = date.fromisoformat(expiry)
+    return S.RiskUnit(
+        key=label,
+        label=label,
+        symbol="ES",
+        asset_class="option",
+        position=position,
+        multiplier=50.0,
+        market_value=None,
+        sec_type="FOP",
+        expiry=settles,
+        strike=strike,
+        right=right,
+        years=years if years is not None else max((settles - ASOF).days, 1) / 365,
+        iv=iv,
+        und_price=6412.5,
+        underlying_is_forward=True,
+        skew_key=("ES", expiry),
+    )
+
+
+@pytest.fixture
+def two_expiries(units):
+    """The recorded book plus a nearer expiry, one short and one long."""
+    return list(units) + [
+        expiry_unit("ESU6 P5800", "2026-09-30", 5800.0, -6.0),
+        expiry_unit("ESU6 P5500", "2026-09-30", 5500.0, 4.0),
+    ]
+
+
+class TestExpiryBreakdown:
+    """`pnl_by_symbol` puts nine ES expiries under one key. On a campaign that
+    runs one root across many expiries that is the wrong unit of account: the
+    operative question is which expiry is holding the trough down, and the only
+    way to answer it was to cross the position list against the curve by hand.
+    """
+
+    def test_the_default_response_is_the_one_callers_already_parse(self, units, shocks):
+        """Retrocompatibility, asserted rather than assumed. Nothing about the
+        shape of a call that passes no new parameter may move."""
+        result, _ = curve(units, shocks)
+        row = result["curve"][0]
+        assert set(row) == {"shock", "pnl_total", "pnl_by_asset_class", "pnl_by_symbol"}
+        assert "troughByExpiry" not in result
+
+    def test_expiry_replaces_symbol_rather_than_joining_it(self, two_expiries, shocks):
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        row = result["curve"][0]
+        assert "pnl_by_expiry" in row
+        assert "pnl_by_symbol" not in row
+
+    def test_both_returns_both_and_none_returns_neither(self, two_expiries, shocks):
+        both, _ = curve(two_expiries, shocks, breakdown="both")
+        assert {"pnl_by_symbol", "pnl_by_expiry"} <= set(both["curve"][0])
+        none, _ = curve(two_expiries, shocks, breakdown="none")
+        assert not {"pnl_by_symbol", "pnl_by_expiry"} & set(none["curve"][0])
+        assert "troughByExpiry" not in none
+
+    def test_every_point_sums_to_its_own_total(self, two_expiries, shocks):
+        """The acceptance criterion, and the reason positions with no expiry
+        get a key of their own: a breakdown that quietly dropped the future and
+        the bond would not add up, and a reader could not tell that from a
+        breakdown that was simply wrong."""
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        for row in result["curve"]:
+            assert sum(row["pnl_by_expiry"].values()) == pytest.approx(
+                row["pnl_total"], abs=0.05
+            )
+
+    def test_the_key_is_the_settlement_date_so_a_weekly_and_a_quarterly_meet(
+        self, units, shocks
+    ):
+        """The fixture's ESZ6 and EW4Z6 last trade on different days and settle
+        the same morning. Two rows there would be two names for one expiry."""
+        result, _ = curve(units, shocks, breakdown="expiry")
+        keys = set(result["curve"][0]["pnl_by_expiry"])
+        assert "ES 2026-12-18" in keys
+        assert "ES 2026-12-17" not in keys
+
+    def test_positions_with_no_expiry_are_named_by_their_class(self, units, shocks):
+        result, _ = curve(units, shocks, breakdown="expiry")
+        keys = set(result["curve"][0]["pnl_by_expiry"])
+        assert "ES (future)" in keys
+        assert "AAPL (equity)" in keys
+        assert not any(k.startswith("AAPL 20") for k in keys)
+
+    def test_an_expiry_row_is_the_pnl_of_that_expiry_alone(self, two_expiries, shocks):
+        """Checked against the same units run on their own, which is the only
+        statement of what the key is supposed to mean."""
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        sept = [u for u in two_expiries if u.expiry == date(2026, 9, 30)]
+        alone, _ = curve(sept, shocks, breakdown="expiry")
+        at = -0.20
+        combined_row = next(r for r in result["curve"] if r["shock"] == at)
+        alone_row = next(r for r in alone["curve"] if r["shock"] == at)
+        assert combined_row["pnl_by_expiry"]["ES 2026-09-30"] == pytest.approx(
+            alone_row["pnl_total"], abs=0.05
+        )
+
+
+class TestTroughByExpiry:
+    def test_it_reports_each_expiry_worst_first(self, two_expiries, shocks):
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        rows = result["troughByExpiry"]
+        assert [r["pnl"] for r in rows] == sorted(r["pnl"] for r in rows)
+        assert {r["key"] for r in rows} == set(result["curve"][0]["pnl_by_expiry"])
+
+    def test_each_row_is_that_expiry_own_minimum(self, two_expiries, shocks):
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        for row in result["troughByExpiry"]:
+            along = [r["pnl_by_expiry"][row["key"]] for r in result["curve"]]
+            assert row["pnl"] == pytest.approx(min(along), abs=0.01)
+
+    def test_it_also_says_what_each_expiry_does_at_the_portfolio_trough(
+        self, two_expiries, shocks
+    ):
+        """The two columns answer different questions. What an expiry can cost
+        is its own minimum; whether it is the one to close is what it
+        contributes where the account's floor actually sits, and an expiry
+        whose worst point is nowhere near the book's is not the one to buy
+        back."""
+        result, _ = curve(two_expiries, shocks, breakdown="expiry")
+        at = result["trough"]["shock"]
+        row = next(r for r in result["curve"] if r["shock"] == at)
+        contributions = {
+            e["key"]: e["pnlAtPortfolioTrough"] for e in result["troughByExpiry"]
+        }
+        assert contributions == pytest.approx(row["pnl_by_expiry"], abs=0.01)
+        assert sum(contributions.values()) == pytest.approx(result["trough"]["pnl"], abs=0.05)
+
+
+class TestValuationDate:
+    """An absolute date instead of counting days out by hand — the arithmetic
+    that goes wrong over a weekend."""
+
+    def test_a_date_becomes_the_offset_it_is(self):
+        assert S.offset_to(date(2026, 9, 30), ASOF) == 47
+        assert S.resolve_offsets(valuation_date="2026-09-30", asof=ASOF) == [47]
+
+    def test_a_weekend_is_not_adjusted_away(self):
+        """No calendar magic. Answering for Monday because Saturday is not a
+        trading day would misdescribe the axis the curve was drawn on."""
+        saturday = date(2026, 8, 15)
+        assert saturday.weekday() == 5
+        assert S.resolve_offsets(valuation_date="2026-08-15", asof=ASOF) == [1]
+
+    def test_a_date_in_the_past_is_refused(self):
+        with pytest.raises(ValueError, match="cannot value a book in the past"):
+            S.resolve_offsets(valuation_date="2026-08-01", asof=ASOF)
+
+    def test_a_date_that_is_not_a_date_says_so(self):
+        with pytest.raises(ValueError, match="ISO calendar dates"):
+            S.parse_valuation_date("30 September")
+
+    def test_the_two_ways_of_saying_when_cannot_both_be_used(self):
+        with pytest.raises(ValueError, match="only one of them can"):
+            S.resolve_offsets(date_offset_days=3, valuation_date="2026-09-30", asof=ASOF)
+
+    def test_a_family_of_dates_resolves_in_the_order_given(self):
+        assert S.resolve_offsets(
+            valuation_dates=["2026-08-14", "2026-08-17"], asof=ASOF
+        ) == [0, 3]
+        assert S.resolve_offsets(date_offsets=[0, 3], asof=ASOF) == [0, 3]
+
+    def test_the_same_date_twice_is_not_a_comparison(self):
+        with pytest.raises(ValueError, match="asked for twice"):
+            S.resolve_offsets(date_offsets=[3, 3], asof=ASOF)
+
+    def test_an_absolute_date_prices_the_same_as_the_offset_it_stands_for(
+        self, units, shocks
+    ):
+        by_offset, _ = curve(units, shocks, date_offset_days=47)
+        by_date, _ = curve(
+            units, shocks, date_offset_days=S.offset_to(date(2026, 9, 30), ASOF)
+        )
+        assert by_date["curve"] == by_offset["curve"]
+
+    def test_a_negative_offset_is_refused_at_the_config(self):
+        cfg = S.StressConfig(shocks=[0.0], date_offset_days=-5)
+        with pytest.raises(ValueError, match="value the book in the past"):
+            cfg.validate()
+
+
+class TestMultipleValuationDates:
+    """Two dates in one call, off one snapshot. Two calls could not promise
+    that: the book and the market move between them, and part of the difference
+    then is not the days at all."""
+
+    def test_the_scenarios_are_crossed_with_the_dates(self, offline):
+        out = run_stress_curve(date_offsets=[0, 3])
+        assert [c["label"] for c in out["curves"]] == [
+            "const @ 2026-08-14",
+            "const @ 2026-08-17",
+            "vol_coord @ 2026-08-14",
+            "vol_coord @ 2026-08-17",
+        ]
+        assert [c["name"] for c in out["curves"]] == [
+            "const",
+            "const",
+            "vol_coord",
+            "vol_coord",
+        ]
+
+    def test_one_date_leaves_the_label_as_the_scenario_name(self, offline):
+        out = run_stress_curve()
+        assert [c["label"] for c in out["curves"]] == ["const", "vol_coord"]
+        assert all(c["dateOffsetDays"] == 0 for c in out["curves"])
+        assert all(c["valuationDate"] == "2026-08-14" for c in out["curves"])
+
+    def test_the_dates_are_named_at_the_top(self, offline):
+        out = run_stress_curve(date_offsets=[0, 3])
+        assert out["valuationDates"] == [
+            {"offsetDays": 0, "valuationDate": "2026-08-14"},
+            {"offsetDays": 3, "valuationDate": "2026-08-17"},
+        ]
+
+    def test_time_is_the_only_thing_that_moved(self, offline):
+        """The curve is model-now against model-then, so a date offset is pure
+        decay: at zero shock the fixture's net short options make money by
+        waiting, and the two curves must differ there."""
+        out = run_stress_curve(date_offsets=[0, 3])
+        by_label = {c["label"]: c for c in out["curves"]}
+
+        def at_zero(label):
+            return next(p["pnl"] for p in by_label[label]["points"] if p["shock"] == 0.0)
+
+        assert at_zero("const @ 2026-08-14") == pytest.approx(0.0, abs=1e-6)
+        assert at_zero("const @ 2026-08-17") != pytest.approx(0.0, abs=1e-6)
+
+    def test_rolling_time_forward_is_flagged_as_decay_not_forecast(self, offline):
+        out = run_stress_curve(date_offsets=[0, 3])
+        assert any("not a forecast" in w for w in out["warnings"])
+        assert not any("not a forecast" in w for w in run_stress_curve()["warnings"])
+
+    def test_the_assumptions_stop_claiming_one_date(self, offline):
+        """Same reasoning as the volatility terms: with a family of dates the
+        base config's single offset describes none of the curves."""
+        one = run_stress_curve()
+        assert one["assumptions"]["dateOffsetDays"] == 0
+        many = run_stress_curve(date_offsets=[0, 3])
+        assert "dateOffsetDays" not in many["assumptions"]
+        assert len(many["assumptions"]["valuationDates"]) == 2
+
+    def test_the_curves_carry_their_expiry_breakdown_too(self, offline):
+        out = run_stress_curve(date_offsets=[0, 3], breakdown="expiry")
+        for entry in out["curves"]:
+            assert entry["troughByExpiry"]
+            assert "pnl_by_expiry" in entry["points"][0]
+            assert "pnl_by_symbol" not in entry["points"][0]

@@ -56,10 +56,12 @@ Three things about the data are worth knowing before quoting any number:
    Navigator's default curve; Risk Navigator's actual volatility shock model is
    not public, so this is an approximation of it, not a reproduction.
 
-The server is read-only. whatif_order is the only tool that reaches IB's order
-path, it sends whatIf=True orders that are never routed, and it is disabled
-unless the server was started with IBKR_ENABLE_WHATIF=true. There is no tool
-here that can submit a live order.""",
+The server is read-only against the account. whatif_order is the only tool that
+reaches IB's order path, it sends whatIf=True orders that are never routed, and
+it is disabled unless the server was started with IBKR_ENABLE_WHATIF=true.
+There is no tool here that can submit a live order. calibrate_vol_coord writes
+one small local file — the volatility calibration it fits — and nothing else
+here writes anywhere.""",
 )
 
 
@@ -325,6 +327,7 @@ def _stress_config(
     fetch_skew: bool,
     scope: str = "equity",
     risk_groups: dict[str, str] | None = None,
+    breakdown: str = "symbol",
 ) -> S.StressConfig:
     return S.StressConfig(
         shocks=list(shocks),
@@ -340,7 +343,31 @@ def _stress_config(
         bond_rate_shift_bp=bond_rate_shift_bp,
         bond_duration_years=bond_duration_years,
         fetch_skew=fetch_skew,
+        breakdown=breakdown,
     )
+
+
+#: Said the same way in three tool signatures, so said once here.
+BREAKDOWN_HELP = (
+    "Which per-point P&L breakdowns to return. 'symbol' — the default and what this "
+    "server has always returned — groups by root, which on an options book collapses "
+    "every ES expiry under one 'ES' key. 'expiry' groups by the option's SETTLEMENT "
+    "date instead ('ES 2026-10-30'), which is the breakdown that answers 'which expiry "
+    "is holding the trough down, and which short do I buy back'. 'both' returns the two "
+    "of them and 'none' neither. Positions with no expiry get a key naming their class "
+    "('ES (future)', 'AAPL (equity)') so the breakdown still sums to the point's total "
+    "and can be checked against it. Responses are large: a book on nine expiries pays "
+    "for the second dictionary at every one of twenty-six shocks, so ask for 'both' "
+    "only when you want both, and 'none' when you only want the curve."
+)
+
+VALUATION_DATE_HELP = (
+    "Value the curve at this ISO date, e.g. '2026-09-30', instead of counting the days "
+    "out by hand into date_offset_days. Mutually exclusive with it. No calendar magic: "
+    "the date is the date, weekend or not, and time to expiry is ACT/365 throughout. "
+    "The P&L is still measured FROM today at today's prices and volatilities, with the "
+    "clock rolled forward — it is decay, not a forecast."
+)
 
 
 @tool()
@@ -377,6 +404,10 @@ async def stress_portfolio(
     ),
     date_offset_days: int = Field(
         default=0, description="Roll the valuation date forward this many days (time decay)."
+    ),
+    valuation_date: str | None = Field(default=None, description=VALUATION_DATE_HELP),
+    breakdown: Literal["symbol", "expiry", "both", "none"] = Field(
+        default="symbol", description=BREAKDOWN_HELP
     ),
     scope: Literal["equity", "all"] = Field(
         default="equity",
@@ -466,6 +497,11 @@ async def stress_portfolio(
       slightly once options go deep in the money.
     - bonds are held flat unless `bond_rate_shift_bp` is set; anything this
       server does not model is held flat and named in `warnings`.
+    - `breakdown='expiry'` adds `pnl_by_expiry` to every point and
+      `troughByExpiry` beside the trough — each expiry's own worst point and
+      what it contributes at the *portfolio's* trough. On a book holding one
+      root across many expiries those are the two different numbers behind
+      "which short is the problem", and `pnl_by_symbol` can answer neither.
 
     **Check `reconciled` before quoting anything.** At zero shock the portfolio
     is rebuilt from its positions and compared against NetLiquidation; a
@@ -484,7 +520,9 @@ async def stress_portfolio(
         vol_bump,
         vol_slope_down,
         vol_slope_up,
-        date_offset_days,
+        S.resolve_offsets(
+            date_offset_days=date_offset_days, valuation_date=valuation_date
+        )[0],
         betas,
         default_beta,
         bond_rate_shift_bp,
@@ -492,6 +530,7 @@ async def stress_portfolio(
         fetch_skew,
         scope,
         risk_groups,
+        breakdown,
     )
     return await S.stress_portfolio(cfg)
 
@@ -584,24 +623,42 @@ async def stress_curve(
     date_offset_days: int = Field(
         default=0, description="Roll the valuation date forward this many days (time decay)."
     ),
-    vol_coord_decay: float = Field(
-        default=4.736,
+    date_offsets: list[int] | None = Field(
+        default=None,
+        description="A FAMILY of valuation dates in one call, as day offsets: [0, 3] is "
+        "today and three days out. Every scenario is run at every offset, and all of "
+        "them come out of ONE loading of the positions and prices — which is what makes "
+        "the comparison mean anything, since calling this tool twice lets the book and "
+        "the market move between the two answers. Mutually exclusive with "
+        "date_offset_days and valuation_dates.",
+    ),
+    valuation_dates: list[str] | None = Field(
+        default=None,
+        description="The same family, given as ISO dates: ['2026-08-28', '2026-08-31']. "
+        "Mutually exclusive with the offset forms. No calendar magic — the date is the "
+        "date, weekend or not.",
+    ),
+    breakdown: Literal["symbol", "expiry", "both", "none"] = Field(
+        default="symbol", description=BREAKDOWN_HELP
+    ),
+    vol_coord_decay: float | None = Field(
+        default=None,
         description="Term damping of the vol_coord model: VR(t) = exp(-decay * t), so a "
         "front-month contract takes nearly the whole shock and a back month a fraction. "
         "IB documents that this function exists and is decreasing but not what it is, so "
-        "the default is FITTED, not published — it reproduces a live Risk Navigator "
-        "Vol.Coord. curve to an RMS of roughly 3% of the curve's own depth. It is one "
-        "number calibrated on one book; refit it against your own Risk Navigator with "
-        "scripts/calibrate_vol_coord.py before trusting it on another.",
+        "this number is FITTED, not published. Left unset it uses your own stored "
+        "calibration if calibrate_vol_coord has ever been run, and otherwise the factory "
+        "fit of 4.736 — one number calibrated on one book, which has no claim on yours. "
+        "`assumptions.volCoordDecaySource` says which of the three you got.",
     ),
-    vol_coord_calibrated_to_years: float = Field(
-        default=0.345,
+    vol_coord_calibrated_to_years: float | None = Field(
+        default=None,
         description="How far out in tenor `vol_coord_decay` was actually constrained. "
-        "The shipped decay was fitted on a book holding nothing past four months, and an "
-        "exponential extrapolates to zero — which would price a one-year option as "
-        "carrying no volatility risk at all in a crash. Positions past this are priced "
-        "anyway and named in `warnings`, so the extrapolation is never silent. Raise it "
-        "only after refitting against targets that actually reach that far.",
+        "Defaults alongside the decay: your calibration's reach if you have one, and "
+        "otherwise 0.345, the four months the shipped fit was constrained over. An "
+        "exponential extrapolates to zero, which would price a one-year option as "
+        "carrying no volatility risk at all in a crash, so positions past this are "
+        "priced anyway and named in `warnings` rather than passing in silence.",
     ),
     bond_rate_shift_bp: float = 0.0,
     bond_duration_years: float = 5.0,
@@ -663,17 +720,35 @@ async def stress_curve(
       where a mark price exists, flagged per position and in `warnings`, and
       held flat only when even that fails.
 
+    - `date_offsets=[0, 3]` (or `valuation_dates`) crosses the scenarios with a
+      family of valuation dates, so "today against Monday, when the August
+      wings expire" is one call rather than two that the market moves between.
+      Each entry under `curves` carries its own `valuationDate` and
+      `dateOffsetDays`; `name` stays the scenario's and `label` distinguishes
+      them. Time is the only thing that moves — today's spot and today's
+      volatilities with the clock advanced, which is decay and not a forecast.
+    - `breakdown='expiry'` puts `pnl_by_expiry` on every point and
+      `troughByExpiry` on every curve, keyed on the option's settlement date.
+      On a book running one root across many expiries that is the only way to
+      see which expiry owns the trough; `pnl_by_symbol` shows one "ES" number
+      for all of them.
+
     `pnl_pct_of_nlv` is on every point, and `netLiquidation` at the top. Quote
     the fraction rather than the amount when comparing two dates or two
     accounts. **Check `reconciled` before quoting any of it.**
     """
+    offsets = S.resolve_offsets(
+        date_offset_days=date_offset_days,
+        date_offsets=date_offsets,
+        valuation_dates=valuation_dates,
+    )
     cfg = _stress_config(
         list(shocks) if shocks else list(S.DEFAULT_SHOCKS),
         vol_mode,
         0.0,
         0.0,
         0.0,
-        date_offset_days,
+        offsets[0],
         betas,
         default_beta,
         bond_rate_shift_bp,
@@ -681,6 +756,7 @@ async def stress_curve(
         fetch_skew,
         scope,
         risk_groups,
+        breakdown,
     )
     if vol_scenarios is None:
         scenarios = list(S.DEFAULT_VOL_SCENARIOS)
@@ -698,9 +774,13 @@ async def stress_curve(
             )
             for v in vol_scenarios
         ]
-    cfg.vol_coord_decay = vol_coord_decay
-    cfg.vol_coord_calibrated_to_years = vol_coord_calibrated_to_years
-    return await S.stress_curve(cfg, scenarios)
+    # Unset means "whatever the calibration says", which StressConfig already
+    # resolved when it was built. Only an explicit value overrides it.
+    if vol_coord_decay is not None:
+        cfg.vol_coord_decay = vol_coord_decay
+    if vol_coord_calibrated_to_years is not None:
+        cfg.vol_coord_calibrated_to_years = vol_coord_calibrated_to_years
+    return await S.stress_curve(cfg, scenarios, offsets)
 
 
 @tool()
@@ -715,6 +795,10 @@ async def stress_whatif(
     vol_slope_down: float = 0.0,
     vol_slope_up: float = 0.0,
     date_offset_days: int = 0,
+    valuation_date: str | None = Field(default=None, description=VALUATION_DATE_HELP),
+    breakdown: Literal["symbol", "expiry", "both", "none"] = Field(
+        default="symbol", description=BREAKDOWN_HELP
+    ),
     scope: Literal["equity", "all"] = "equity",
     risk_groups: dict[str, str] | None = None,
     betas: dict[str, float] | None = None,
@@ -742,6 +826,13 @@ async def stress_whatif(
     is reported in `legProblems` and left out of the second curve; the
     comparison then covers only the legs that did resolve, and says so.
 
+    With `breakdown='expiry'` all three curves are broken out by settlement
+    date, and the difference curve's `pnl_by_expiry` is where the structure
+    actually landed: the expiry you traded against moves and the ones you did
+    not read zero, which is how a hedge is told apart from a change of subject.
+    A short expiry whose row goes to roughly nothing in `withLegs` is one the
+    structure has closed out.
+
     Nothing is sent to IB's order path here — this is pure local repricing. For
     what the structure costs in margin, use whatif_order.
     """
@@ -751,7 +842,9 @@ async def stress_whatif(
         vol_bump,
         vol_slope_down,
         vol_slope_up,
-        date_offset_days,
+        S.resolve_offsets(
+            date_offset_days=date_offset_days, valuation_date=valuation_date
+        )[0],
         betas,
         default_beta,
         bond_rate_shift_bp,
@@ -759,8 +852,135 @@ async def stress_whatif(
         fetch_skew,
         scope,
         risk_groups,
+        breakdown,
     )
     return await S.stress_whatif(legs, cfg)
+
+
+class RiskNavigatorPoint(BaseModel):
+    """One reading off Risk Navigator's Vol.Coord. curve."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    shock: float = Field(
+        description="Where on the x-axis you read it, as a FRACTION: -0.20 is a 20% "
+        "fall. Not a percent.",
+        validation_alias=AliasChoices("shock", "shock_pct_as_fraction"),
+    )
+    pnl: float = Field(
+        description="The portfolio P&L Risk Navigator shows there, in account currency, "
+        "signed: a loss is negative.",
+        validation_alias=AliasChoices("pnl", "target"),
+    )
+
+
+@tool(read_only=False, idempotent=False)
+async def calibrate_vol_coord(
+    targets: list[RiskNavigatorPoint] = Field(
+        description="Four or more points read off Risk Navigator's Vol.Coord. curve, "
+        "spread across the range you care about. Three is the minimum the fit will "
+        "accept and it constrains almost nothing; points bunched near the money "
+        "constrain nothing at all. Get them from the Equity tab if you run the default "
+        "scope='equity', so the curve you are fitting to excludes FX and rates the same "
+        "way this engine does."
+    ),
+    scope: Literal["equity", "all"] = Field(
+        default="equity",
+        description="Match the Risk Navigator tab the readings came from. Its Equity tab "
+        "is 'equity', the default.",
+    ),
+    vol_mode: Literal["sticky_strike", "sticky_moneyness"] = Field(
+        default="sticky_strike",
+        description="Match the run you intend to use the decay in. sticky_strike is the "
+        "default everywhere else and is what Risk Navigator's own curve does.",
+    ),
+    risk_groups: dict[str, str] | None = Field(
+        default=None,
+        description="Same override as elsewhere, e.g. {'TLT': 'rates'}. Use the same one "
+        "you pass to stress_curve, or the fit is against a different book than the runs "
+        "that will use it.",
+    ),
+    betas: dict[str, float] | None = None,
+    default_beta: float = 1.0,
+    fetch_skew: bool = False,
+    persist: bool = Field(
+        default=True,
+        description="Store the fit as this machine's standing calibration, so every "
+        "later stress_curve uses it without being told. Set false to see the fit "
+        "without adopting it. A fit against a portfolio that does not reconcile is "
+        "never stored, whatever this says.",
+    ),
+) -> dict[str, Any]:
+    """Fit `vol_coord_decay` to YOUR Risk Navigator, and keep the result.
+
+    `vol_coord` reproduces IB's volatility-coordinated model. Its asymmetry — a
+    fall moves volatility ten times as hard as a rise — is IB's, documented.
+    Its term damping `VR(t)` is not: IB says only that the function exists and
+    is decreasing. **The number this server ships was fitted to one screenshot
+    of somebody else's Risk Navigator, from nine points read off a chart by
+    eye.** It has no claim on your book, every vol_coord result says so in
+    `warnings`, and this tool is how you replace it.
+
+    What to do:
+
+    1. In TWS open Risk Navigator's risk graph, on the Equity tab if you use
+       the default scope.
+    2. Read the **Vol.Coord.** curve — the one that responds to volatility, not
+       the constant-volatility line — at four or more shocks spread across the
+       range you care about.
+    3. Pass them in as `{shock: -0.20, pnl: -28000}` pairs, shocks as
+       fractions.
+
+    The fit comes back with the residual at every point and, more usefully,
+    with what to distrust about it: the tenor range your positions actually
+    constrain, and the most extreme volatility the fitted decay produces. **A
+    decay that reproduces the curve by pricing a wing at 150% has fitted the
+    chart rather than the market**, and it says so rather than leaving you to
+    find out three layers down in a P&L.
+
+    Unless `persist=false`, the fit is written to disk and becomes the default
+    `vol_coord_decay` for every later `stress_curve` on this machine — no
+    restart, no carrying the number by hand — together with what it was fitted
+    against, which is then reported in `assumptions.volCoordDecaySource`. Set
+    `IBKR_CALIBRATION_FILE` to move the file. It is the only thing this server
+    writes.
+
+    A fit taken against a portfolio that does not reconcile is returned but
+    **not** stored. The reason is asymmetry of failure: a curve that is missing
+    a position announces itself through `reconciled`, while a decay that
+    absorbed the same gap would go on silently deforming every vol_coord run
+    afterwards.
+
+    Nothing here trades or quotes. It reads positions and reprices locally.
+    """
+    points = {float(p.shock): float(p.pnl) for p in targets}
+    if len(points) < 3:
+        raise ValueError(
+            "a decay cannot be fitted to fewer than three distinct shocks; four or more "
+            "spread across the range is what makes the answer mean anything"
+        )
+    if min(points) >= 0:
+        raise ValueError(
+            "none of these shocks is negative. The volatility response is asymmetric and "
+            "almost all of it is on the downside; a fit from the upside alone does not "
+            "constrain the damping at all."
+        )
+    cfg = _stress_config(
+        sorted(points),
+        vol_mode,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        betas,
+        default_beta,
+        0.0,
+        5.0,
+        fetch_skew,
+        scope,
+        risk_groups,
+    )
+    return await S.run_calibration(cfg, points, persist=persist)
 
 
 @tool(read_only=False, idempotent=True)

@@ -1,5 +1,11 @@
 """Refit the vol_coord damping against your own Risk Navigator.
 
+There is now a ``calibrate_vol_coord`` **tool** that does exactly this from
+inside a conversation, and it is the easier route. This script is the same fit
+from a shell, for a run you would rather script or keep out of a transcript;
+both go through one code path and write the same file, so neither can drift
+from the other.
+
 ``vol_coord`` reproduces IB's volatility-coordinated model. Its asymmetry — a
 fall moves volatility ten times as hard as a rise — is documented by IB. Its
 term-structure damping ``VR(t)`` is not: IB says only that the function exists
@@ -26,7 +32,10 @@ and the most extreme volatility the fitted decay produces. A decay that
 reproduces the curve by pricing a wing at 150% has fitted the chart rather than
 the market, and it says so.
 
-Nothing here trades, quotes or writes: it reads positions and prices locally.
+Unless ``--no-persist`` is given the result is stored, and every later
+``stress_curve`` on this machine uses it without being told. Nothing here
+trades or quotes: it reads positions and prices locally, and the one thing it
+writes is that calibration file.
 """
 
 from __future__ import annotations
@@ -37,9 +46,7 @@ import sys
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
 
-from ibkr_risk_mcp import marketdata as MD  # noqa: E402
 from ibkr_risk_mcp import stress as S  # noqa: E402
-from ibkr_risk_mcp.connection import connection  # noqa: E402
 
 
 def read_point(raw: str) -> tuple[float, float]:
@@ -72,6 +79,12 @@ async def main() -> int:
         choices=list(S.SCOPES),
         help="Match Risk Navigator's tab. Its Equity tab is 'equity', the default.",
     )
+    parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help="Print the fit without adopting it. By default it is stored and every "
+        "later stress_curve on this machine uses it.",
+    )
     args = parser.parse_args()
 
     targets = dict(args.points)
@@ -84,13 +97,8 @@ async def main() -> int:
         )
         return 2
 
-    await connection.get()
-    holdings = await MD.load_holdings(with_greeks=True)
-    units = [S.unit_from_holding(h) for h in holdings]
     cfg = S.StressConfig(shocks=sorted(targets), scope=args.scope)
-    cfg.validate()
-
-    result = S.calibrate_vol_coord(units, cfg, targets)
+    result = await S.run_calibration(cfg, targets, persist=not args.no_persist)
 
     print(f"\nvol_coord_decay = {result['decay']}      RMS = {result['rms']:,.0f} USD\n")
     print(f"  {'shock':>7} {'RN target':>12} {'model':>12} {'residual':>11}")
@@ -115,12 +123,19 @@ async def main() -> int:
     for warning in result["warnings"]:
         print(f"\n  WARNING: {warning}")
 
-    print(
-        "\nTo use it, pass vol_coord_decay="
-        f"{result['decay']} and vol_coord_calibrated_to_years="
-        f"{result['calibratedToYears']} to stress_curve — the second is what makes the "
-        "engine warn instead of extrapolating in silence.\n"
-    )
+    if result["stored"]:
+        print(
+            f"\nStored at {result['storedAt']}. Every later stress_curve on this "
+            "machine uses it without being told; pass vol_coord_decay explicitly to "
+            "override it for one call.\n"
+        )
+    else:
+        print(
+            "\nNot stored. To use this fit, pass vol_coord_decay="
+            f"{result['decay']} and vol_coord_calibrated_to_years="
+            f"{result['calibratedToYears']} to stress_curve — the second is what makes "
+            "the engine warn instead of extrapolating in silence.\n"
+        )
     return 0
 
 

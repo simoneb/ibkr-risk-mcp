@@ -114,3 +114,16 @@ def fake_ib(snapshot) -> FakeIB:
             for tag, value in snapshot["account"].items()
         ]
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_calibration(tmp_path, monkeypatch):
+    """No test may read or write the developer's own calibration.
+
+    ``vol_coord_decay`` now defaults to whatever ``calibrate_vol_coord`` last
+    stored, which means that without this the suite would pass or fail
+    depending on whether the machine running it happens to have refitted its
+    own Risk Navigator. Every test gets an empty directory and therefore the
+    factory decay, unless it writes one itself.
+    """
+    monkeypatch.setenv("IBKR_CALIBRATION_FILE", str(tmp_path / "vol_coord.json"))

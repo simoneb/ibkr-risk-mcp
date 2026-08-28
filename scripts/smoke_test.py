@@ -229,6 +229,47 @@ async def step_stress_curve() -> None:
     )
 
 
+async def step_expiry_and_dates() -> None:
+    """The expiry breakdown and a family of valuation dates, in one call.
+
+    Two invariants worth exercising against a real book rather than a fixture.
+    The breakdown must sum to each point's own total — that is what makes it
+    checkable rather than merely plausible — and two dates asked for at once
+    must come back as separate curves off one snapshot.
+    """
+    result = await S.stress_curve(
+        S.StressConfig(shocks=list(S.DEFAULT_SHOCKS), breakdown="expiry"),
+        [S.VolScenario("const")],
+        date_offsets=[0, 3],
+    )
+    curves = result["curves"]
+    dates = [c["valuationDate"] for c in curves]
+    if len(curves) != 2:
+        record("FAIL", "stress_curve dates", f"asked for 2 dates, got {len(curves)} curve(s)")
+        return
+
+    worst = 0.0
+    for curve in curves:
+        for point in curve["points"]:
+            drift = abs(sum(point["pnl_by_expiry"].values()) - point["pnl"])
+            worst = max(worst, drift)
+
+    today = curves[0]
+    rows = today.get("troughByExpiry") or []
+    top = "; ".join(
+        f"{r['key']} {r.get('pnlAtPortfolioTrough', r['pnl']):,.0f}" for r in rows[:4]
+    )
+    detail = (
+        f"{len(curves)} curve(s) valued {dates[0]} and {dates[1]} off one snapshot\n"
+        f"       {len(rows)} expiry bucket(s); worst at the trough: {top or 'none'}\n"
+        f"       largest gap between the breakdown and its point total: {worst:.4f}"
+    )
+    # A cent of rounding per key is expected; anything larger means a position
+    # is in the total and in no bucket, which would make the breakdown a
+    # different portfolio from the curve above it.
+    record("FAIL" if worst > 0.05 * max(len(rows), 1) else "PASS", "expiry breakdown", detail)
+
+
 async def step_stress_whatif(
     holdings: list[MD.Holding], fallback_symbol: str, fallback_sec_type: str
 ) -> None:
@@ -517,6 +558,7 @@ async def main() -> int:
         await step_surface(holdings, args.probe_underlying, args.probe_sec_type)
         await step_stress(args.shock_range, args.step)
         await step_stress_curve()
+        await step_expiry_and_dates()
         await step_stress_whatif(holdings, args.probe_underlying, args.probe_sec_type)
         await step_whatif(holdings, args.probe_underlying, args.probe_sec_type)
     finally:

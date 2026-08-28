@@ -308,14 +308,16 @@ footer{border-top:1px solid var(--rule); padding:28px 0 44px; color:var(--muted)
   <div class="wrap">
     <div class="sec-head">
       <p class="label">Surface</p>
-      <h2>Seven tools</h2>
-      <p>Each carries the protocol's annotations, so a client can group them by permission. Six only read. The seventh is the one that touches IB's order path, and it stays inert unless you switch it on.</p>
+      <h2>Nine tools</h2>
+      <p>Each carries the protocol's annotations, so a client can group them by permission. Seven only read. Of the other two, one touches IB's order path and stays inert unless you switch it on; the other writes a volatility calibration to a small local file. Neither changes anything in the account.</p>
     </div>
     <table class="tbl">
       <thead><tr><th>Tool</th><th>What it returns</th></tr></thead>
       <tbody>
         <tr><td>stress_portfolio</td><td>The P&amp;L curve across underlying shocks, its trough, a per-position breakdown, and a reconciliation against NetLiquidation</td></tr>
         <tr><td>stress_whatif</td><td>Three curves and three troughs: the portfolio, the portfolio plus hypothetical legs, and the difference</td></tr>
+        <tr><td>stress_curve</td><td>A curve per volatility regime and valuation date over one snapshot, broken down by symbol or by option expiry</td></tr>
+        <tr><td>calibrate_vol_coord</td><td>Refits IB's volatility-coordinated model against your own Risk Navigator, and keeps the fit for every later curve</td></tr>
         <tr><td>get_position_greeks</td><td>IB's model greeks for every option position, with both expiry dates and the forward its model used</td></tr>
         <tr><td>get_vol_surface</td><td>IB's implied volatility grid for an underlying, by expiry and strike, with days to settlement</td></tr>
         <tr><td>get_margin_summary</td><td>Margin and liquidity, split into the securities and commodities segments</td></tr>

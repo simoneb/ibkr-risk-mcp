@@ -79,6 +79,7 @@ As a Claude Desktop extension, `manifest.json` surfaces host, port, client id, a
 | `IBKR_GREEKS_TIMEOUT` | `4` | Seconds to wait for greeks on one contract. Short by design — IB answers fast or never, and explicit refusals cut the wait short anyway |
 | `IBKR_MAX_MKT_DATA_LINES` | `40` | Concurrent market data subscriptions. IB allows about 50 |
 | `IBKR_CONNECT_TIMEOUT` | `6` | Seconds for the API handshake |
+| `IBKR_CALIBRATION_FILE` | `~/.ibkr-risk-mcp/vol_coord.json` | Where `calibrate_vol_coord` stores the fitted `vol_coord_decay`. The only file this server writes |
 
 Copy `.env.example` to `.env` for local runs.
 
@@ -91,11 +92,29 @@ Copy `.env.example` to `.env` for local runs.
 | `get_position_greeks` | IB's model greeks for every option position, with both expiry dates |
 | `get_vol_surface` | IB's implied volatility grid for an underlying, by expiry and strike |
 | `stress_portfolio` | The P&L curve across underlying shocks, and its trough |
-| `stress_curve` | The same curve under several volatility regimes at once — risk-graph data, with the vol assumption as a visible parameter |
+| `stress_curve` | The same curve under several volatility regimes and valuation dates at once — risk-graph data, with the vol assumption as a visible parameter |
 | `stress_whatif` | The same curve with hypothetical legs added: base, with-legs, and the difference |
+| `calibrate_vol_coord` | Refit the volatility-coordinated model against your own Risk Navigator, and keep the fit |
 | `whatif_order` | IB's margin impact of a structure, per leg and cumulatively. Needs the gate below |
 
-Each tool carries the protocol's annotations, so a client can group them by permission. Seven are marked read-only; `whatif_order` is not, because it puts something on IB's order channel even though nothing is routable.
+Each tool carries the protocol's annotations, so a client can group them by permission. Seven are marked read-only. `whatif_order` is not, because it puts something on IB's order channel even though nothing is routable; `calibrate_vol_coord` is not either, because it writes the fit to disk — neither of them changes anything in the account.
+
+## Reading the curve: by symbol, by expiry, at another date
+
+Every stress result carries the P&L broken down per shock. By default that breakdown is keyed on the **symbol**, which is the right unit for a book of many underlyings and the wrong one for a book running one underlying across many expiries: nine ES expiries all land under a single `ES` key, and the operative question — *which expiry is holding the trough down, and which short do I buy back* — has to be reconstructed by hand from the position list.
+
+`breakdown` changes the key. `expiry` groups on the option's **settlement** date (`ES 2026-10-30`), so a quarterly and a weekly that settle the same morning are one row rather than two names for one expiry. Positions with no expiry get a key naming their class — `ES (future)`, `AAPL (equity)` — so the breakdown still sums to the point's total and can be checked against it rather than trusted. `both` returns symbol and expiry, `none` neither, and `symbol` remains the default: the responses are already large, and a second dictionary at every one of twenty-six shocks is not free.
+
+With an expiry breakdown the result also carries `troughByExpiry`, two columns per expiry that answer two different questions:
+
+- `pnl` — that expiry's own worst point along the curve, which is what it can cost.
+- `pnlAtPortfolioTrough` — what it contributes at the shock where the *account's* floor actually sits, which is what says whether closing it would move that floor.
+
+They come apart, and the gap is the useful part. An expiry whose own minimum sits at −35% while the book troughs at −22% is not the one to buy back, and reading only the first column would nominate it.
+
+**Valuation dates.** `date_offset_days` rolls the clock forward; `valuation_date` takes the ISO date instead, so "the curve at 30 September" does not have to be counted out by hand over a weekend. There is no calendar adjustment — the date is the date — and both forms mean the same thing: the P&L is still measured *from today*, at today's spot and today's implied volatilities, with time advanced. That is decay and the change in convexity that comes with it, not a forecast of where the market will be.
+
+`stress_curve` takes a **family** of them, `date_offsets: [0, 3]` or `valuation_dates: [...]`, and crosses them with the volatility scenarios. That is not a convenience: comparing today against Monday used to take two calls, and the book and the market moved between them, so part of the difference between the two curves was not the three days at all. One call, one loading of positions and prices, and time is the only thing that changed. Each entry under `curves` carries its own `valuationDate` and `dateOffsetDays`; `name` stays the scenario's and `label` distinguishes the pair.
 
 ## The what-if gate
 
@@ -172,13 +191,17 @@ with the residual at every shock inside the error of reading the targets off a c
 
 Every `vol_coord` curve running on the shipped decay **says so in `warnings`**. And the fit was constrained only out to **0.345 years**, because that is all the book it came from held; past there an exponential does not merely lose accuracy, it decays to nothing. At one year `VR` is 0.009, so this model would reprice a LEAPS as though a 20% crash barely touched its volatility. Any position beyond `vol_coord_calibrated_to_years` is priced anyway and **named in `warnings`**, because a silent extrapolation that understates long-dated vega is exactly the failure this server exists not to have. A floor on `VR` would tidy the symptom away and hide it, so there isn't one.
 
-To replace the number rather than trust it:
+To replace the number rather than trust it, call `calibrate_vol_coord` with four or more readings off Risk Navigator's own Vol.Coord. curve on its Equity tab — `{shock: -0.20, pnl: -28000}`, shocks as fractions. The same fit is available from a shell:
 
 ```
-uv run python scripts/calibrate_vol_coord.py -0.05=-8000 -0.10=-22000 -0.15=-31500 -0.20=-28000 -0.25=-12000
+uv run python scripts/calibrate_vol_coord.py -- -0.05=-8000 -0.10=-22000 -0.15=-31500 -0.20=-28000 -0.25=-12000
 ```
 
-Those are readings off Risk Navigator's own Vol.Coord. curve on its Equity tab. The script refits the decay and returns the residual at every point, the tenor range your positions actually constrain, and the most extreme volatility the fit produces — a decay that reproduces the curve by pricing a wing at 150% has fitted the chart rather than the market, and it tells you so.
+Either route refits the decay and returns the residual at every point, the tenor range your positions actually constrain, and the most extreme volatility the fit produces — a decay that reproduces the curve by pricing a wing at 150% has fitted the chart rather than the market, and it tells you so.
+
+**The fit is kept.** It goes to `~/.ibkr-risk-mcp/vol_coord.json` (`IBKR_CALIBRATION_FILE` moves it) and becomes the default `vol_coord_decay` for every later `stress_curve` on that machine, no restart and nothing to carry by hand — which was the actual reason the shipped number kept being the one in use. Stored beside it is what it was fitted against: the targets, the residuals, the account, the date. A calibrated run then reports that provenance in `assumptions.volCoordDecaySource` and in `warnings` instead of the "factory decay" caveat, and a decay you pass explicitly is described as neither — this server did not fit it and does not vouch for it.
+
+A fit taken against a portfolio that does **not** reconcile is returned but never stored. The asymmetry is the point: a curve missing a position announces itself through `reconciled`, while a decay that absorbed the same gap would go on deforming every later run with nothing to give it away.
 
 Being **relative** is the part that matters, and it is why the additive slopes were removed from the defaults. Multiplying every volatility by the same factor puts more *points* on a wing already quoted at 41% than on a 31% at-the-money, so the surface steepens by itself. A parallel shift in points cannot do that at any slope, and on a ratio book the difference is not a matter of degree: the additive model made the curve monotonically worse through the region where Risk Navigator turns it back up, and put its crossover around −35% where Risk Navigator puts it near −18%. Measured there, `vol_coord` troughs at roughly **60% of the depth** of the constant-volatility curve and at a **much shallower shock** — so a rising-volatility regime came out as the *better* one, the opposite of what a naive short-vega reading predicts. That is the reason the regimes are returned as separate curves rather than as a band.
 
@@ -216,7 +239,9 @@ src/ibkr_risk_mcp/
   stress.py       the stress and what-if engine
   margin.py       whatif_order and the segmented margin summary
   contracts.py    expiry and underlying normalisation
+  calibration.py  where the fitted vol_coord decay is stored between sessions
 scripts/smoke_test.py
+scripts/calibrate_vol_coord.py
 tests/
 ```
 

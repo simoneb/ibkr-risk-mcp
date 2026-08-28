@@ -30,11 +30,12 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from ib_async import Contract
 
+from . import calibration
 from . import contracts as C
 from . import marketdata as MD
 from . import pricing
@@ -46,6 +47,17 @@ log = logging.getLogger(__name__)
 VOL_MODES = ("sticky_strike", "sticky_moneyness")
 
 SCOPES = ("equity", "all")
+
+#: Which per-point P&L breakdowns a curve carries.
+#:
+#: ``symbol`` is what every result has always returned and remains the default,
+#: because the responses are already large and a second dictionary per point is
+#: not free: a book on nine expiries and thirty-three symbols pays for it
+#: twenty-six times over. ``expiry`` answers the question ``symbol`` cannot on
+#: an options book — with every ES expiry collapsed under one "ES" key, "which
+#: expiry is holding the trough down" had to be reconstructed by hand from the
+#: position list. ``none`` is there for a caller that only wants the curve.
+BREAKDOWNS = ("symbol", "expiry", "both", "none")
 
 #: How far the reconciliation may miss NetLiquidation before the result is
 #: flagged. One percent is the prompt's threshold and a fair one: below it the
@@ -121,12 +133,24 @@ class StressConfig:
     #: for the best two-parameter additive fit. It is one number calibrated on
     #: one book, and it should be refitted against your own Risk Navigator
     #: before being trusted on another.
-    vol_coord_decay: float = DEFAULT_VOL_COORD_DECAY
+    #:
+    #: Defaults to whatever ``calibrate_vol_coord`` last stored, and to the
+    #: factory fit only when nothing has been stored. A calibration that had to
+    #: be quoted back on every call was one nobody quoted back.
+    vol_coord_decay: float = field(
+        default_factory=lambda: calibration.decay(DEFAULT_VOL_COORD_DECAY)
+    )
     #: Tenor beyond which the decay above was never calibrated. Positions past
     #: it still price, and are named in `warnings` so the extrapolation is not
     #: silent.
-    vol_coord_calibrated_to_years: float = DEFAULT_VOL_COORD_CALIBRATED_YEARS
+    vol_coord_calibrated_to_years: float = field(
+        default_factory=lambda: calibration.calibrated_to_years(
+            DEFAULT_VOL_COORD_CALIBRATED_YEARS
+        )
+    )
     date_offset_days: int = 0
+    #: Which per-point P&L breakdowns to return; see :data:`BREAKDOWNS`.
+    breakdown: str = "symbol"
     betas: dict[str, float] = field(default_factory=dict)
     default_beta: float = 1.0
     #: Which underlyings are on the shock axis at all.
@@ -168,6 +192,16 @@ class StressConfig:
             raise ValueError(f"vol_mode must be one of {VOL_MODES}, got {self.vol_mode!r}")
         if self.scope not in SCOPES:
             raise ValueError(f"scope must be one of {SCOPES}, got {self.scope!r}")
+        if self.breakdown not in BREAKDOWNS:
+            raise ValueError(
+                f"breakdown must be one of {BREAKDOWNS}, got {self.breakdown!r}"
+            )
+        if self.date_offset_days < 0:
+            raise ValueError(
+                "date_offset_days rolls the valuation date forward; a negative value "
+                "would value the book in the past, where this engine has no prices. "
+                f"Got {self.date_offset_days}."
+            )
         if not self.shocks:
             raise ValueError("shocks must contain at least one value")
         if max(abs(s) for s in self.shocks) > 1.0:
@@ -243,6 +277,111 @@ DEFAULT_VOL_SCENARIOS: tuple["VolScenario", ...] = (
 )
 
 
+# --------------------------------------------------------------------------
+# when the curve is valued
+# --------------------------------------------------------------------------
+
+
+def parse_valuation_date(raw: str) -> date:
+    """An ISO date, and nothing cleverer.
+
+    No weekend or holiday adjustment: "the curve at 30 September" means the
+    30th, and a server that silently answered for the 2nd of October because
+    the 30th happened to be a Saturday would be lying about the axis it drew.
+    Time to expiry is ACT/365 throughout, so a non-trading valuation date is
+    arithmetically fine and simply carries a day more decay than the previous
+    session close.
+    """
+    try:
+        return date.fromisoformat(raw.strip())
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(
+            f"valuation dates are ISO calendar dates, e.g. '2026-09-30'; got {raw!r}"
+        ) from exc
+
+
+def offset_to(target: date, asof: date | None = None) -> int:
+    """Calendar days from the valuation baseline to ``target``.
+
+    An absolute date is sugar over ``date_offset_days``, not a second mode:
+    both curves are still measured *from today*, priced at today's spot and
+    today's volatility with time rolled forward. That is what makes the answer
+    "what this book earns or loses between now and then", which is the question
+    a date was being counted out by hand to ask.
+    """
+    base = asof or date.today()
+    days = (target - base).days
+    if days < 0:
+        raise ValueError(
+            f"{target.isoformat()} is {-days} day(s) before the valuation baseline "
+            f"{base.isoformat()}. This engine rolls time forward from today's prices; "
+            "it cannot value a book in the past."
+        )
+    return days
+
+
+def resolve_offsets(
+    *,
+    date_offset_days: int = 0,
+    valuation_date: str | None = None,
+    date_offsets: Sequence[int] | None = None,
+    valuation_dates: Sequence[str] | None = None,
+    asof: date | None = None,
+) -> list[int]:
+    """The one list of day offsets a run is valued at, from whichever of the
+    four ways of saying it the caller used.
+
+    They are mutually exclusive rather than combined. Two of them given at once
+    is a caller who believes one thing and asked for another, and picking a
+    winner would hide that: ``date_offset_days=3`` beside
+    ``valuation_date='2026-09-30'`` has no reading that is obviously right.
+    """
+    given = [
+        name
+        for name, value in (
+            ("date_offset_days", date_offset_days or None),
+            ("valuation_date", valuation_date),
+            ("date_offsets", list(date_offsets) if date_offsets else None),
+            ("valuation_dates", list(valuation_dates) if valuation_dates else None),
+        )
+        if value
+    ]
+    if len(given) > 1:
+        raise ValueError(
+            "these say when the curve is valued and only one of them can: got "
+            + ", ".join(given)
+            + ". Use date_offsets or valuation_dates for a family of dates."
+        )
+
+    if valuation_dates:
+        offsets = [offset_to(parse_valuation_date(d), asof) for d in valuation_dates]
+    elif valuation_date:
+        offsets = [offset_to(parse_valuation_date(valuation_date), asof)]
+    elif date_offsets:
+        offsets = [int(d) for d in date_offsets]
+    else:
+        offsets = [int(date_offset_days)]
+
+    for offset in offsets:
+        if offset < 0:
+            raise ValueError(
+                f"date offsets roll the valuation date forward; {offset} would value "
+                "the book in the past, where this engine has no prices."
+            )
+    if len(set(offsets)) != len(offsets):
+        raise ValueError(
+            f"the same valuation date was asked for twice: offsets {offsets}. Two "
+            "identical curves are not a comparison."
+        )
+    return offsets
+
+
+def valuation_date_of(offset: int, asof: date | None = None) -> str:
+    """The calendar date an offset lands on, so a curve says when it is valued
+    rather than making the reader add days to today."""
+    return ((asof or date.today()) + timedelta(days=offset)).isoformat()
+
+
 @dataclass
 class RiskUnit:
     """One repricable thing. Built from a real position or a hypothetical leg;
@@ -269,6 +408,12 @@ class RiskUnit:
     #: ``{"ESZ6": 1.0}`` picks out one quarterly where ``{"ES": 1.0}`` takes
     #: every contract on the root.
     und_symbol: str | None = None
+    #: Settlement date, for options only. This is the key the P&L breakdown
+    #: groups on, and it is the *settlement* date rather than the last trading
+    #: date for the same reason the skew buckets are: a quarterly and a weekly
+    #: that settle the same morning are one expiry to a risk book, however
+    #: differently TWS lists them.
+    expiry: date | None = None
     strike: float | None = None
     right: str | None = None
     years: float | None = None
@@ -287,6 +432,21 @@ class RiskUnit:
         if self.asset_class != "option":
             return True
         return None not in (self.strike, self.right, self.years, self.iv, self.und_price)
+
+    @property
+    def expiry_key(self) -> str:
+        """The bucket this position falls in under the expiry breakdown.
+
+        ``ES 2026-10-30`` for an option; ``ES (future)``, ``AAPL (equity)`` for
+        everything that has no expiry to speak of. Two things follow from
+        giving those a key of their own rather than dropping them: the
+        breakdown sums to the point's total, so a reader can check it against
+        `pnl` instead of trusting it, and a key without a date on it is
+        visibly not an expiry.
+        """
+        if self.expiry is not None:
+            return f"{self.symbol} {self.expiry.isoformat()}"
+        return f"{self.symbol} ({self.asset_class})"
 
     def forward(self, shock: float, years: float, rate: float) -> float:
         spot = float(self.und_price or 0.0) * (1.0 + shock)
@@ -337,6 +497,7 @@ def unit_from_holding(h: MD.Holding, asof: date | None = None) -> RiskUnit:
     if h.asset_class != "option":
         return base
     greeks = h.greeks or {}
+    base.expiry = C.settlement_date(contract)
     base.strike = float(contract.strike) if contract.strike else None
     base.right = (contract.right or "")[:1].upper() or None
     base.years = C.years_to_expiry(contract, asof=asof)
@@ -410,6 +571,7 @@ async def units_from_legs(
                     }
                 )
                 continue
+            unit.expiry = C.settlement_date(contract)
             unit.strike = float(contract.strike)
             unit.right = (contract.right or "")[:1].upper()
             unit.years = C.years_to_expiry(contract, asof=asof)
@@ -835,37 +997,89 @@ def trough_of(points: list[tuple[float, float]]) -> dict[str, Any]:
     return out
 
 
+def trough_by_expiry(
+    rows: Sequence[Mapping[str, Any]], portfolio_trough_shock: float
+) -> list[dict[str, Any]]:
+    """Each expiry's own worst point, and what it contributes at the
+    portfolio's.
+
+    These are two different questions and the gap between them answers a third.
+    ``pnl`` is where that expiry alone is worst, which says what it can cost.
+    ``pnlAtPortfolioTrough`` is what it is doing at the shock that actually
+    defines the account's risk floor, which is what says whether closing it
+    would move that floor. A short expiry whose own minimum sits at −35% while
+    the book troughs at −22% is not the one to buy back, and reading only the
+    first column would nominate it.
+
+    Sorted worst-first, so the expiry holding the trough down is the first row.
+    """
+    keys = sorted({k for row in rows for k in row.get("pnl_by_expiry", {})})
+    out: list[dict[str, Any]] = []
+    for key in keys:
+        points = [(float(r["shock"]), float(r["pnl_by_expiry"].get(key, 0.0))) for r in rows]
+        worst = min(points, key=lambda p: p[1])
+        at_trough = next(
+            (pnl for shock, pnl in points if shock == portfolio_trough_shock), None
+        )
+        row: dict[str, Any] = {
+            "key": key,
+            "shock": worst[0],
+            "pnl": round(worst[1], 2),
+        }
+        if at_trough is not None:
+            row["pnlAtPortfolioTrough"] = round(at_trough, 2)
+        out.append(row)
+    out.sort(key=lambda r: r["pnl"])
+    return out
+
+
 def run_curve(
     units: Sequence[RiskUnit],
     cfg: StressConfig,
     surfaces: dict[str, pricing.VolSurface],
 ) -> dict[str, Any]:
-    """The P&L curve and its trough for one set of units."""
+    """The P&L curve and its trough for one set of units.
+
+    Which breakdowns come back is ``cfg.breakdown``'s to decide. Both are
+    accumulated either way — the arithmetic is a dictionary add per position
+    and costs nothing next to the repricing — but only the ones asked for are
+    serialised, because the payload is where this actually gets expensive.
+    """
+    want_symbol = cfg.breakdown in ("symbol", "both")
+    want_expiry = cfg.breakdown in ("expiry", "both")
     rows: list[dict[str, Any]] = []
     for shock in cfg.shocks:
         by_class: dict[str, float] = {}
         by_symbol: dict[str, float] = {}
+        by_expiry: dict[str, float] = {}
         total = 0.0
         for unit in units:
             pnl = unit_pnl(unit, shock, cfg, surfaces)
             total += pnl
             by_class[unit.asset_class] = by_class.get(unit.asset_class, 0.0) + pnl
             by_symbol[unit.symbol] = by_symbol.get(unit.symbol, 0.0) + pnl
-        rows.append(
-            {
-                "shock": round(float(shock), 6),
-                "pnl_total": round(float(total), 2),
-                "pnl_by_asset_class": {k: round(float(v), 2) for k, v in sorted(by_class.items())},
-                "pnl_by_symbol": {k: round(float(v), 2) for k, v in sorted(by_symbol.items())},
-            }
-        )
+            key = unit.expiry_key
+            by_expiry[key] = by_expiry.get(key, 0.0) + pnl
+        row: dict[str, Any] = {
+            "shock": round(float(shock), 6),
+            "pnl_total": round(float(total), 2),
+            "pnl_by_asset_class": {k: round(float(v), 2) for k, v in sorted(by_class.items())},
+        }
+        if want_symbol:
+            row["pnl_by_symbol"] = {k: round(float(v), 2) for k, v in sorted(by_symbol.items())}
+        if want_expiry:
+            row["pnl_by_expiry"] = {k: round(float(v), 2) for k, v in sorted(by_expiry.items())}
+        rows.append(row)
     points = [(r["shock"], r["pnl_total"]) for r in rows]
     best = max(points, key=lambda p: p[1])
+    trough = trough_of(points)
     out: dict[str, Any] = {
         "curve": rows,
-        "trough": trough_of(points),
+        "trough": trough,
         "peak": {"shock": float(best[0]), "pnl": round(float(best[1]), 2)},
     }
+    if want_expiry:
+        out["troughByExpiry"] = trough_by_expiry(rows, float(trough["shock"]))
     refined = _parabolic_trough(points)
     if refined:
         out["troughRefined"] = refined
@@ -1054,14 +1268,22 @@ def scope_warnings(
         }
     )
     if attenuated:
+        # The pointer has to name a key the response actually carries, so it
+        # follows `breakdown` rather than naming pnl_by_symbol unconditionally.
+        where = {
+            "symbol": "in `pnl_by_symbol`",
+            "expiry": "in `pnl_by_expiry`",
+            "both": "in `pnl_by_symbol` and `pnl_by_expiry`",
+            "none": "not broken out at all, since `breakdown` is 'none'",
+        }[cfg.breakdown]
         out.append(
             f"Positions on {', '.join(attenuated)} were repriced at a beta-scaled move of "
             "their own underlying rather than at the full shock. That is what makes this "
             "curve readable when one underlying does not belong on the axis — but it does "
             "not *measure* those positions, it stands them down. A short strangle "
             "attenuated to a fifth of the equity move still carries its whole gap risk, "
-            "and none of that risk is on this curve. Their contribution here is in "
-            "`pnl_by_symbol`; their own scenario is not modelled by this server."
+            f"and none of that risk is on this curve. Their contribution here is {where}; "
+            "their own scenario is not modelled by this server."
         )
 
     if not include_vol:
@@ -1087,6 +1309,27 @@ def scope_warnings(
             "vol_slope_down (1.0 is one volatility point per 1% fall) to put it in."
         )
     return out
+
+
+def decay_source(cfg: StressConfig) -> str:
+    """Where the decay in force came from, in one line.
+
+    Three cases and they are not interchangeable: your own fit, this server's
+    factory fit, or a number the caller typed. The stored calibration is only
+    claimed when the decay actually matches it — a caller who overrides
+    ``vol_coord_decay`` by hand must not have somebody else's provenance
+    attached to their number.
+    """
+    stored = calibration.load()
+    if stored and abs(cfg.vol_coord_decay - float(stored["decay"])) < 1e-9:
+        return calibration.provenance() or "a stored calibration with no provenance"
+    if cfg.vol_coord_decay == DEFAULT_VOL_COORD_DECAY:
+        return (
+            "this server's factory fit to one Risk Navigator screenshot on one account "
+            "— not published by IB, and with no claim on your book. Refit it with the "
+            "calibrate_vol_coord tool."
+        )
+    return "passed in by the caller; this server did not fit it and cannot vouch for it"
 
 
 def assumptions(cfg: StressConfig) -> dict[str, Any]:
@@ -1115,7 +1358,11 @@ def assumptions(cfg: StressConfig) -> dict[str, Any]:
             if cfg.vol_coord
             else None
         ),
+        "volCoordDecay": cfg.vol_coord_decay if cfg.vol_coord else None,
+        "volCoordDecaySource": decay_source(cfg) if cfg.vol_coord else None,
         "dateOffsetDays": cfg.date_offset_days,
+        "valuationDate": valuation_date_of(cfg.date_offset_days, cfg.asof),
+        "pnlBreakdown": cfg.breakdown,
         "riskFreeRate": cfg.rate,
         "scope": cfg.scope,
         "scopeMeaning": (
@@ -1215,18 +1462,33 @@ async def stress_whatif(legs: Sequence[C.Leg], cfg: StressConfig) -> dict[str, A
 
     base = run_curve(base_units, cfg, surfaces)
     withlegs = run_curve(combined, cfg, surfaces)
-    diff_points = [
-        {
+    diff_points: list[dict[str, Any]] = []
+    for b, w in zip(base["curve"], withlegs["curve"]):
+        point: dict[str, Any] = {
             "shock": b["shock"],
             "pnl_total": round(float(w["pnl_total"] - b["pnl_total"]), 2),
         }
-        for b, w in zip(base["curve"], withlegs["curve"])
-    ]
+        # The per-expiry difference is the row that answers "did the structure
+        # land where the damage is". A leg bought against one expiry shows up
+        # under that expiry alone, and an expiry it did not touch reads zero,
+        # which is how you tell a hedge from a change of subject.
+        if "pnl_by_expiry" in b:
+            keys = set(b["pnl_by_expiry"]) | set(w["pnl_by_expiry"])
+            point["pnl_by_expiry"] = {
+                k: round(w["pnl_by_expiry"].get(k, 0.0) - b["pnl_by_expiry"].get(k, 0.0), 2)
+                for k in sorted(keys)
+            }
+        diff_points.append(point)
     diff_pairs = [(r["shock"], r["pnl_total"]) for r in diff_points]
+    diff_trough = trough_of(diff_pairs)
     difference: dict[str, Any] = {
         "curve": diff_points,
-        "trough": trough_of(diff_pairs),
+        "trough": diff_trough,
     }
+    if cfg.breakdown in ("expiry", "both"):
+        difference["troughByExpiry"] = trough_by_expiry(
+            diff_points, float(diff_trough["shock"])
+        )
     refined = _parabolic_trough(diff_pairs)
     if refined:
         difference["troughRefined"] = refined
@@ -1325,8 +1587,10 @@ def curve_points(
             "shock_pct": round(shock * 100.0, 4),
             "pnl": round(pnl, 2),
             "pnl_by_asset_class": row["pnl_by_asset_class"],
-            "pnl_by_symbol": row["pnl_by_symbol"],
         }
+        for key in ("pnl_by_symbol", "pnl_by_expiry"):
+            if key in row:
+                point[key] = row[key]
         if spot:
             point["underlying"] = round(spot * (1.0 + shock), 4)
         if net_liquidation:
@@ -1337,9 +1601,12 @@ def curve_points(
 
 
 async def stress_curve(
-    cfg: StressConfig, scenarios: Sequence[VolScenario]
+    cfg: StressConfig,
+    scenarios: Sequence[VolScenario],
+    date_offsets: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """One curve per volatility regime, over one loading of the portfolio.
+    """One curve per volatility regime and valuation date, over one loading of
+    the portfolio.
 
     The regimes differ only in how the volatility *level* responds to the shock,
     which is the assumption Risk Navigator hides. ``vol_slope_down=0`` is the
@@ -1352,6 +1619,13 @@ async def stress_curve(
     same snapshot, so the curves are differences in assumption rather than
     differences in market data — which running the single-curve tool three times
     could not guarantee, since the book moves between calls.
+
+    ``date_offsets`` extends that guarantee to the time axis. "Today against
+    Monday, when the August wings expire" used to take two calls, and the book
+    and the market moved between them, so part of the difference between the
+    two curves was not the three days at all. Given several offsets the
+    scenarios are crossed with them and every curve comes out of the same
+    positions and the same prices, leaving time as the only thing that changed.
     """
     cfg.validate()
     if not scenarios:
@@ -1359,8 +1633,14 @@ async def stress_curve(
     names = [s.name for s in scenarios]
     if len(set(names)) != len(names):
         raise ValueError(f"scenario names must be unique, got {names}")
+    offsets = resolve_offsets(
+        date_offset_days=cfg.date_offset_days,
+        date_offsets=date_offsets,
+        asof=cfg.asof,
+    )
     for scenario in scenarios:
-        replace(cfg, **scenario.overrides()).validate()
+        for offset in offsets:
+            replace(cfg, **scenario.overrides(), date_offset_days=offset).validate()
 
     ib = await connection.get()
     holdings = await MD.load_holdings(with_greeks=True)
@@ -1419,6 +1699,19 @@ async def stress_curve(
         "where you are on the axis rather than being fixed. Compare them against each "
         "other rather than reading any one of them as the answer."
     )
+    if any(offsets):
+        warnings.append(
+            "One or more curves are valued forward in time, at "
+            + ", ".join(
+                f"{valuation_date_of(o, cfg.asof)} (+{o}d)" for o in offsets if o
+            )
+            + ". Time is the only thing that moves: they are priced off TODAY's spot "
+            "and TODAY's implied volatilities with the clock advanced, so what they "
+            "show is decay and the change in convexity that comes with it, not a "
+            "forecast of where the market will be. Anything expiring inside the window "
+            "is carried to a hundredth of a day rather than removed from the book, so "
+            "it settles at intrinsic value rather than disappearing."
+        )
 
     reconciliation = reconcile(holdings, ib, connection.require_account())
     net_liq = reconciliation.get("netLiquidation")
@@ -1448,36 +1741,55 @@ async def stress_curve(
         }
         for s in scenarios
     ]
+    # Same reasoning as the volatility terms above: with a family of dates the
+    # base config's single offset describes none of the curves.
+    dates = [
+        {"offsetDays": o, "valuationDate": valuation_date_of(o, cfg.asof)} for o in offsets
+    ]
+    if len(offsets) > 1:
+        shared.pop("dateOffsetDays", None)
+        shared["valuationDates"] = dates
 
     curves: list[dict[str, Any]] = []
     for scenario in scenarios:
-        scfg = replace(cfg, **scenario.overrides())
-        result = run_curve(units, scfg, surfaces)
-        points = curve_points(result["curve"], spot, net_liq)
-        entry: dict[str, Any] = {
-            "name": scenario.name,
-            "volSlopeDown": scenario.vol_slope_down,
-            "volSlopeUp": scenario.vol_slope_up,
-            "volBump": scenario.vol_bump,
-            "volCoord": scenario.vol_coord,
-            "points": points,
-            "trough": result["trough"],
-            "peak": result["peak"],
-        }
-        if "troughRefined" in result:
-            entry["troughRefined"] = result["troughRefined"]
-        worst = min(points, key=lambda p: p["pnl"])
-        entry["minPnl"] = worst["pnl"]
-        entry["minAtShockPct"] = worst["shock_pct"]
-        if "pnl_pct_of_nlv" in worst:
-            entry["minPnlPctOfNlv"] = worst["pnl_pct_of_nlv"]
-        if "underlying" in worst:
-            entry["minAtUnderlying"] = worst["underlying"]
-        curves.append(entry)
+        for offset in offsets:
+            scfg = replace(cfg, **scenario.overrides(), date_offset_days=offset)
+            result = run_curve(units, scfg, surfaces)
+            points = curve_points(result["curve"], spot, net_liq)
+            valued_at = valuation_date_of(offset, cfg.asof)
+            entry: dict[str, Any] = {
+                "name": scenario.name,
+                # `name` stays the scenario's alone, so a consumer keyed on it
+                # does not change meaning the day a second date is asked for.
+                # `label` is what distinguishes two curves in one result.
+                "label": scenario.name if len(offsets) == 1 else f"{scenario.name} @ {valued_at}",
+                "dateOffsetDays": offset,
+                "valuationDate": valued_at,
+                "volSlopeDown": scenario.vol_slope_down,
+                "volSlopeUp": scenario.vol_slope_up,
+                "volBump": scenario.vol_bump,
+                "volCoord": scenario.vol_coord,
+                "points": points,
+                "trough": result["trough"],
+                "peak": result["peak"],
+            }
+            if "troughByExpiry" in result:
+                entry["troughByExpiry"] = result["troughByExpiry"]
+            if "troughRefined" in result:
+                entry["troughRefined"] = result["troughRefined"]
+            worst = min(points, key=lambda p: p["pnl"])
+            entry["minPnl"] = worst["pnl"]
+            entry["minAtShockPct"] = worst["shock_pct"]
+            if "pnl_pct_of_nlv" in worst:
+                entry["minPnlPctOfNlv"] = worst["pnl_pct_of_nlv"]
+            if "underlying" in worst:
+                entry["minAtUnderlying"] = worst["underlying"]
+            curves.append(entry)
 
     return {
         "underlying": reference,
         "netLiquidation": net_liq,
+        "valuationDates": dates,
         "curves": curves,
         "volSurfaceUsed": surface_rows,
         "reconciliation": reconciliation,
@@ -1504,14 +1816,27 @@ def vol_coord_warnings(units: Sequence[RiskUnit], cfg: StressConfig) -> list[str
     option as having no volatility risk at all.
     """
     out: list[str] = []
-    if cfg.vol_coord_decay == DEFAULT_VOL_COORD_DECAY:
+    stored = calibration.load()
+    if stored and abs(cfg.vol_coord_decay - float(stored["decay"])) < 1e-9:
+        # A calibrated run still says where its number came from. The warning
+        # changes from "distrust this" to "here is what it was fitted against",
+        # because a fit is only as current as the book it was fitted on.
+        out.append(
+            f"vol_coord is running on YOUR calibration, decay {cfg.vol_coord_decay:g}, "
+            + (calibration.provenance() or "provenance unrecorded")
+            + ". Refit with the calibrate_vol_coord tool when the book's tenor mix "
+            "changes materially, or when the const curve stops lining up with Risk "
+            "Navigator's blue line."
+        )
+    elif cfg.vol_coord_decay == DEFAULT_VOL_COORD_DECAY:
         out.append(
             f"vol_coord is running on the factory decay of {DEFAULT_VOL_COORD_DECAY:g}. IB "
             "documents that VR(t) exists and is decreasing but not what it is, so this "
             "number is a FIT — to one Risk Navigator screenshot, on one account, from "
             "nine points read off a chart by eye. The 10x/1x asymmetry above it is IB's "
             "own and is on firmer ground than the damping is. Recalibrate against your "
-            "own Risk Navigator with scripts/calibrate_vol_coord.py before treating a "
+            "own Risk Navigator with the calibrate_vol_coord tool — read four or more "
+            "points off its Vol.Coord. curve and pass them in — before treating a "
             "vol_coord curve as anything but indicative."
         )
 
@@ -1658,4 +1983,71 @@ def calibrate_vol_coord(
             else None
         ),
         "warnings": warnings,
+    }
+
+
+async def run_calibration(
+    cfg: StressConfig,
+    targets: Mapping[float, float],
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Fit the decay against the live account and, unless told not to, keep it.
+
+    This is :func:`calibrate_vol_coord` with the two things around it that make
+    it usable from a conversation rather than from a shell: it loads the book
+    itself, and it writes the result where every later run will find it.
+
+    It refuses to store a fit taken against a portfolio that does not
+    reconcile. A curve that is missing a position is missing it at every shock,
+    so the decay that reproduces Risk Navigator from it is absorbing the gap —
+    and unlike a bad curve, a bad stored decay is silent: it would go on
+    quietly deforming every vol_coord run afterwards with nothing to say it
+    came from a broken snapshot. The fit is still returned, with the reason.
+    """
+    cfg.validate()
+    ib = await connection.get()
+    account = connection.require_account()
+    holdings = await MD.load_holdings(with_greeks=True)
+    units = [unit_from_holding(h, cfg.asof) for h in holdings]
+    surfaces, warnings = await build_surfaces(units, cfg)
+
+    fit = calibrate_vol_coord(units, cfg, targets, surfaces)
+    reconciliation = reconcile(holdings, ib, account)
+    reconciled = bool(reconciliation.get("reconciled", False))
+
+    stored: str | None = None
+    if not persist:
+        warnings.append(
+            "Not stored, because persist=false. Pass vol_coord_decay="
+            f"{fit['decay']} to stress_curve by hand, or run this again with persist "
+            "left at its default to make it the standing calibration."
+        )
+    elif not reconciled:
+        warnings.append(
+            "NOT STORED: the portfolio does not reconcile against NetLiquidation, so "
+            "this decay was fitted to a book that is missing something. A bad curve "
+            "announces itself; a bad stored decay would not, and it would deform every "
+            "vol_coord run from here on. Fix the reconciliation and refit."
+        )
+    else:
+        record = {
+            "decay": fit["decay"],
+            "calibratedToYears": fit["calibratedToYears"],
+            "rms": fit["rms"],
+            "fittedAt": datetime.now().isoformat(timespec="seconds"),
+            "account": account,
+            "scope": cfg.scope,
+            "volMode": cfg.vol_mode,
+            "points": fit["points"],
+        }
+        stored = str(calibration.save(record))
+
+    return {
+        **fit,
+        "stored": stored is not None,
+        "storedAt": stored,
+        "reconciliation": reconciliation,
+        "reconciled": reconciled,
+        "assumptions": assumptions(replace(cfg, vol_coord=True, vol_coord_decay=fit["decay"])),
+        "warnings": [*fit["warnings"], *warnings],
     }

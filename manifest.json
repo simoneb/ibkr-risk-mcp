@@ -4,7 +4,7 @@
   "display_name": "IBKR Risk (TWS)",
   "version": "0.2.0",
   "description": "Model greeks, IB's volatility surface, what-if margin, and portfolio stress curves from Interactive Brokers.",
-  "long_description": "Fills the gap the official IBKR connector leaves: portfolio risk. Pulls IB's own model greeks and implied volatility surface out of TWS, asks IB's margin engine what a hypothetical structure would cost, and rebuilds the P&L-versus-underlying curve locally so you can ask where the trough sits and where a new option position would move it. TWS or IB Gateway must be running on this machine with the API enabled — the extension talks to its local socket, never to IBKR over the internet. It is read-only: the only tool that touches the order path sends whatIf=True orders that IB evaluates and discards, and it stays inert unless you enable it below.",
+  "long_description": "Fills the gap the official IBKR connector leaves: portfolio risk. Pulls IB's own model greeks and implied volatility surface out of TWS, asks IB's margin engine what a hypothetical structure would cost, and rebuilds the P&L-versus-underlying curve locally so you can ask where the trough sits and where a new option position would move it. TWS or IB Gateway must be running on this machine with the API enabled — the extension talks to its local socket, never to IBKR over the internet. It is read-only against your account: the only tool that touches the order path sends whatIf=True orders that IB evaluates and discards, and it stays inert unless you enable it below. The one thing it writes anywhere is a small local file holding the volatility calibration you fit against your own Risk Navigator.",
   "author": {
     "name": "Simone Busoli",
     "url": "https://github.com/simoneb"
@@ -30,7 +30,8 @@
         "IBKR_ACCOUNT": "${user_config.account}",
         "IBKR_MARKET_DATA_TYPE": "${user_config.market_data_type}",
         "IBKR_RISK_FREE_RATE": "${user_config.risk_free_rate}",
-        "IBKR_ENABLE_WHATIF": "${user_config.enable_whatif}"
+        "IBKR_ENABLE_WHATIF": "${user_config.enable_whatif}",
+        "IBKR_CALIBRATION_FILE": "${user_config.calibration_file}"
       }
     }
   },
@@ -82,6 +83,13 @@
       "title": "Allow what-if margin checks",
       "description": "Off by default, and off means the connection to TWS itself is opened read-only. On, whatif_order can ask IB's margin engine what a structure would cost. Those orders carry whatIf=True and are never routed to a market — but this is the only tool that touches the order path at all, so it is a switch rather than an assumption. No tool here can submit a live order either way.",
       "default": false
+    },
+    "calibration_file": {
+      "type": "string",
+      "title": "Calibration file (optional)",
+      "description": "Where the volatility-coordinated model's calibration is stored. Its term damping is fitted rather than published by IB, and the value shipped was fitted against somebody else's Risk Navigator. Run the calibrate_vol_coord tool against your own and the fit is written here, then picked up by every later stress curve without being passed back by hand. Leave empty for ~/.ibkr-risk-mcp/vol_coord.json. It is the only file this extension writes.",
+      "default": "",
+      "required": false
     }
   },
   "tools_generated": true,
