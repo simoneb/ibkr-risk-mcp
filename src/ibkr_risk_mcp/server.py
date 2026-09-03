@@ -13,21 +13,61 @@ import functools
 import logging
 from typing import Any, Callable, Literal, Sequence
 
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from . import marketdata as MD
 from . import stress as S
 from . import contracts as C
 from . import margin as M
+from . import calibration as CAL
+from .auth import verifier_for
 from .config import settings
 from .connection import AccountAmbiguous, IBUnavailable, connection
 
 logging.basicConfig(level=logging.WARNING)
 
+log = logging.getLogger(__name__)
+
+
+def _auth_settings() -> AuthSettings | None:
+    """The SDK's auth configuration, or None when auth is off.
+
+    Passing this alongside a token verifier is all it takes to become a
+    conformant resource server: the SDK mounts
+    /.well-known/oauth-protected-resource (RFC 9728) and answers an
+    unauthenticated request with the `WWW-Authenticate: Bearer
+    resource_metadata=...` challenge that points a client at it. Token
+    issuance, authorization-server metadata and client registration stay with
+    the provider, where they belong — this server never sees a credential.
+    """
+    if not settings.mcp_auth:
+        return None
+    return AuthSettings(
+        issuer_url=AnyHttpUrl(settings.mcp_auth_issuer),  # type: ignore[arg-type]
+        resource_server_url=AnyHttpUrl(settings.mcp_resource_url),  # type: ignore[arg-type]
+        required_scopes=[settings.mcp_auth_scope],
+    )
+
+
 mcp = FastMCP(
     "ibkr-risk-mcp",
+    host=settings.mcp_host,
+    port=settings.mcp_port,
+    streamable_http_path=settings.mcp_path,
+    token_verifier=verifier_for(settings),
+    auth=_auth_settings(),
+    # Session affinity buys this server nothing. Everything it holds between
+    # calls — the IB connection, the market data semaphore, the contract
+    # details cache, the stored calibration — is process-global by design and
+    # is deliberately shared by every caller, because TWS keys API sessions by
+    # client id and will not give a second connection to the same one. So a
+    # request that lands without a session id has lost nothing it would have
+    # had with one, and dropping the requirement removes a whole class of
+    # "session expired" failure from a client's path to a P&L curve.
+    stateless_http=True,
     instructions="""This server exposes Interactive Brokers' *risk* data: model greeks,
 IB's implied volatility surface, what-if margin, and a local stress engine that
 rebuilds the portfolio P&L curve across underlying shocks.
@@ -38,9 +78,13 @@ chains and watchlists all come from there. Use this server only for questions
 about risk: where the P&L trough sits, what a hypothetical structure does to
 it, what margin it needs, and what IB's volatility surface looks like.
 
-It needs TWS or IB Gateway running on this machine with the API enabled. If any
-tool fails, call check_connection first — it distinguishes "not running" from
-"API switch off" from "no account logged in", which have different fixes.
+It reads a live account through TWS or IB Gateway, which may be on this machine
+or on a host this server reaches over the network. If any tool fails, call
+check_connection first: it distinguishes "not running" from "API switch off"
+from "client id taken" from "no account logged in", names the machine the
+problem is on, and returns a `hint` that says what to do about it. Pass that
+hint on rather than guessing — the user may not be sitting at the machine
+running TWS, and some of these are not theirs to fix.
 
 Three things about the data are worth knowing before quoting any number:
 
@@ -61,7 +105,9 @@ reaches IB's order path, it sends whatIf=True orders that are never routed, and
 it is disabled unless the server was started with IBKR_ENABLE_WHATIF=true.
 There is no tool here that can submit a live order. calibrate_vol_coord writes
 one small local file — the volatility calibration it fits — and nothing else
-here writes anywhere.""",
+here writes anywhere. check_connection reports whether that calibration is in
+place; without it every stress curve falls back to a decay fitted against
+somebody else's book, which is worth saying out loud when quoting one.""",
 )
 
 
@@ -135,6 +181,12 @@ async def check_connection() -> dict[str, Any]:
     - `connected` — everything is in place.
 
     `hint` says what to do about the state in each case.
+
+    `calibration` reports whether a fitted vol_coord decay is in use and what
+    it was fitted against, or null if the server is running on the factory
+    number. Worth checking after any redeploy: the fit lives in a file, losing
+    it is silent by design, and every stress_curve afterwards is quietly less
+    accurate than the one before.
     """
     probe = await connection.probe()
     accounts = probe.get("accounts") or []
@@ -159,6 +211,13 @@ async def check_connection() -> dict[str, Any]:
             "marketDataType": settings.market_data_type,
             "whatIfEnabled": settings.enable_whatif,
         },
+        # Whether a fitted vol_coord decay is in place, and what it was fitted
+        # against. None means the factory number is in use — which is a real
+        # answer and an easily missed one: `calibration.load()` falls back
+        # rather than raising, by design, so a calibration file that was lost
+        # in a redeploy costs every later stress run its accuracy and says
+        # nothing at all. This is where that becomes visible.
+        "calibration": CAL.provenance(),
     }
 
 
@@ -1019,7 +1078,32 @@ async def whatif_order(
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    """Serve, over whichever transport was configured.
+
+    The HTTP branch runs uvicorn from inside ``mcp.run``, which awaits
+    ``Server.serve()`` on the loop it is already on rather than calling
+    ``uvicorn.run()``. That matters more than it looks: ``uvicorn.run`` selects
+    ``loop="auto"``, which is uvloop wherever uvloop is installed, and ib_async
+    drives its own socket transport on whatever loop it finds. Keeping the
+    process on plain asyncio keeps ib_async on the loop it is tested against.
+    A future deployment that prefers the uvicorn CLI over this entry point
+    needs ``--loop asyncio`` to stay equivalent.
+    """
+    if settings.mcp_transport == "http":
+        # basicConfig above pins the root at WARNING, which is right for a
+        # subprocess talking MCP over a pipe and wrong for a service somebody
+        # has to find the endpoint of. The handler itself has no level, so
+        # lifting this logger is enough to let the line through.
+        log.setLevel(logging.INFO)
+        log.info(
+            "serving MCP over streamable HTTP at http://%s:%s%s",
+            settings.mcp_host,
+            settings.mcp_port,
+            settings.mcp_path,
+        )
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

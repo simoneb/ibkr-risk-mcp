@@ -16,7 +16,7 @@ Risk Navigator's risk model is not exposed by any API, so the strategy is to pul
 
 ## Prerequisites
 
-1. **TWS or IB Gateway running and logged in** on this machine. The server talks to its local socket; it never reaches IBKR over the internet.
+1. **TWS or IB Gateway running and logged in.** The server talks to its socket directly; it never reaches IBKR over the internet. Usually that is the same machine — for a Gateway on a host the server reaches over the network instead, see [docs/remote.md](docs/remote.md).
 2. **The API enabled.** File → Global Configuration → API → Settings → tick **Enable ActiveX and Socket Clients**. Until you do, TWS opens no port at all and `check_connection` reports `not_listening`.
 3. **Market data** for the instruments you hold. Model greeks come from IB's own option model, so a contract the account cannot price has no greeks and is reported under `missing`. Contrary to what is widely repeated, **delayed data does carry model greeks** — verified against live TWS, where an unsubscribed account got nothing from market data types 1 and 2 and implied volatilities from type 3. If you lack the subscription, set `IBKR_MARKET_DATA_TYPE=3` and read the numbers as a quarter of an hour old.
 4. For `whatif_order` only: **Read-Only API must be off** in that same TWS screen. That setting blocks what-if orders too.
@@ -64,6 +64,12 @@ uv run python -m ibkr_risk_mcp.server
 
 As a Claude Desktop extension, `manifest.json` surfaces host, port, client id, account, market data type, risk-free rate and the what-if gate as a settings form, so none of them need editing by hand.
 
+### Over HTTP
+
+The default transport is stdio — a server the client launches as a subprocess — and everything above assumes it. `IBKR_MCP_TRANSPORT=http` serves streamable HTTP instead, for a server running somewhere the client cannot launch it: beside an IB Gateway on a host that stays up, behind a reverse proxy, reached as a custom connector.
+
+That mode adds a bearer-token boundary (OAuth 2.1 resource server, tokens issued by an identity provider you choose), a service unit, and a set of timeouts measured rather than guessed. All of it is in **[docs/remote.md](docs/remote.md)**; none of it changes the stdio path, which remains the default and is unaffected.
+
 ## Environment variables
 
 | Variable | Default | |
@@ -82,6 +88,8 @@ As a Claude Desktop extension, `manifest.json` surfaces host, port, client id, a
 | `IBKR_CALIBRATION_FILE` | `~/.ibkr-risk-mcp/vol_coord.json` | Where `calibrate_vol_coord` stores the fitted `vol_coord_decay`. The only file this server writes |
 
 Copy `.env.example` to `.env` for local runs.
+
+The HTTP transport and its authentication add `IBKR_MCP_*` variables — transport, listen address, path, and the bearer-token settings. They are documented in `.env.example` and in [docs/remote.md](docs/remote.md); none of them affect a stdio run.
 
 ## Tools
 
@@ -240,8 +248,11 @@ src/ibkr_risk_mcp/
   margin.py       whatif_order and the segmented margin summary
   contracts.py    expiry and underlying normalisation
   calibration.py  where the fitted vol_coord decay is stored between sessions
+  auth.py         bearer token verification, for the HTTP transport only
 scripts/smoke_test.py
 scripts/calibrate_vol_coord.py
+scripts/http_smoke.py       drives the HTTP transport as a real client would
+docs/remote.md              running it over HTTP: auth, timeouts, the service unit
 tests/
 ```
 

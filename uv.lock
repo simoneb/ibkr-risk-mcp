@@ -303,10 +303,12 @@ name = "ibkr-risk-mcp"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "ib-async" },
     { name = "mcp" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "python-dotenv" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -320,9 +322,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "ib-async", specifier = ">=1.0.3,<3.0" },
-    { name = "mcp", specifier = ">=1.6.0,<2.0" },
+    { name = "mcp", specifier = ">=1.10.0,<2.0" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<9.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23,<2.0" },
     { name = "python-dotenv", specifier = ">=1.0,<2.0" },

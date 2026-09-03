@@ -34,3 +34,17 @@ jobs:
       # connection — a broken tool signature would otherwise only surface in a
       # client.
       - run: uv run python -c "import asyncio; from ibkr_risk_mcp.server import mcp; print(sorted(t.name for t in asyncio.run(mcp.list_tools())))"
+      # And it must serve them over HTTP. The step above imports the module; this
+      # one spawns the real entry point, speaks streamable HTTP to it with a real
+      # MCP client, and initialises a session — which is the only place a
+      # transport wiring mistake can actually show up. Needs no TWS: it stops
+      # before any tool that would want one.
+      - run: uv run python scripts/http_smoke.py
+      # The auth boundary, end to end: a stub identity provider, a real token,
+      # and the four answers that matter — 401 with a discovery challenge, 200
+      # for the allowlisted subject, 403 for a valid token naming anyone else,
+      # 401 for expired or wrong-audience. Needs no TWS, because every one of
+      # those is decided before a tool runs. It is here rather than in pytest
+      # because what it checks is that the verifier is *wired in*, which only a
+      # real server over a real socket can show.
+      - run: uv run python scripts/http_smoke.py --auth

@@ -28,11 +28,21 @@ classifiers = [
   "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
-  "mcp>=1.6.0,<2.0",
+  # 1.10 is the floor for the OAuth resource-server surface: AuthSettings grew
+  # `resource_server_url` there, and with it the RFC 9728 metadata route and
+  # the WWW-Authenticate challenge that the auth module relies on the SDK to
+  # serve. Verified against the 1.9.4 and 1.10.0 wheels.
+  "mcp>=1.10.0,<2.0",
   "ib-async>=1.0.3,<3.0",
   "numpy>=1.26",
   "scipy>=1.11",
   "python-dotenv>=1.0,<2.0",
+  # Both arrive transitively with mcp today, and both are imported directly by
+  # `auth`, which makes them ours to pin rather than ours to inherit. The
+  # `crypto` extra is what supplies RS256 and friends; PyJWT without it can
+  # only do HMAC, which this server refuses.
+  "pyjwt[crypto]>=2.8,<3.0",
+  "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

@@ -62,6 +62,36 @@ class IBUnavailable(RuntimeError):
         self.detail = detail
 
 
+_LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def where(cfg: Settings) -> str:
+    """How to name the machine TWS is on, in a sentence somebody will act on.
+
+    These hints used to say "this machine" and send the reader to a TWS menu,
+    which was right while the only deployment was a server the client launched
+    on the user's own desktop. Over HTTP the Gateway is usually on a host the
+    reader is not sitting at and may not be able to see, and a hint that tells
+    them to open a dialog that is not in front of them is worse than no hint:
+    it describes a fix they cannot carry out and does not say where to go
+    instead.
+
+    So the location is stated rather than assumed, and stated differently for
+    the two cases, because "this machine" is genuinely more useful when it is
+    true.
+    """
+    if cfg.host in _LOOPBACK:
+        return f"this machine ({cfg.host}:{cfg.port})"
+    return f"the machine running TWS/IB Gateway, {cfg.host}:{cfg.port}"
+
+
+def where_short(cfg: Settings) -> str:
+    """:func:`where` without the address, for a sentence that already gave it."""
+    if cfg.host in _LOOPBACK:
+        return "this machine"
+    return "the machine running TWS/IB Gateway"
+
+
 async def port_is_listening(host: str, port: int, timeout: float = 1.5) -> bool:
     """Whether something accepts a TCP connection on the port. This is the
     cheap half of the diagnosis: it separates "nothing is running" from every
@@ -138,11 +168,11 @@ class IBConnection:
         if not await port_is_listening(cfg.host, cfg.port):
             others = [p for p in await scan_known_ports(cfg.host) if p["listening"]]
             hint = (
-                f"Nothing is listening on {cfg.host}:{cfg.port}. Either TWS/IB Gateway is "
-                "not running, or it is running with the API switch off — TWS opens no "
-                "port at all until 'Enable ActiveX and Socket Clients' is ticked under "
-                "File > Global Configuration > API > Settings. Check the port on that "
-                "same screen while you are there."
+                f"Nothing is listening on {cfg.host}:{cfg.port}. On {where_short(cfg)}, either "
+                "TWS/IB Gateway is not running, or it is running with the API switch off "
+                "— it opens no port at all until 'Enable ActiveX and Socket Clients' is "
+                "ticked under File > Global Configuration > API > Settings. The port is "
+                "on that same screen."
             )
             if others:
                 found = ", ".join(f"{p['port']} ({p['description']})" for p in others)
@@ -166,8 +196,10 @@ class IBConnection:
             raise IBUnavailable(
                 "api_not_enabled",
                 f"{cfg.host}:{cfg.port} accepts connections but never completed the API "
-                "handshake. In TWS: File > Global Configuration > API > Settings, tick "
-                '"Enable ActiveX and Socket Clients", and add this machine to "Trusted IPs".',
+                f"handshake. In the TWS on {where_short(cfg)}: File > Global "
+                'Configuration > API > Settings, tick "Enable ActiveX and Socket Clients", '
+                "and make sure the address this server connects from is listed under "
+                '"Trusted IPs".',
                 "; ".join(self._api_errors[-3:]),
             ) from None
         except Exception as exc:  # ib_async raises plain ConnectionError here
@@ -175,15 +207,17 @@ class IBConnection:
             if any(marker in text for marker in _CLIENT_ID_MARKERS):
                 raise IBUnavailable(
                     "client_id_in_use",
-                    f"clientId {cfg.client_id} is already connected to this TWS. Set "
-                    "IBKR_CLIENT_ID to a value no other script uses (and never 0, which "
+                    f"clientId {cfg.client_id} is already connected to the TWS on "
+                    f"{where(cfg)}. Something else is holding it — another copy of this "
+                    "server, a script, or an earlier process that has not been reaped. "
+                    "Set IBKR_CLIENT_ID to a value nothing else uses (and never 0, which "
                     "TWS reserves for manually placed orders).",
                     str(exc),
                 ) from None
             raise IBUnavailable(
                 "connect_failed",
-                f"TWS refused the connection: {exc}. Check the API settings and that the "
-                "client id is free.",
+                f"TWS refused the connection: {exc}. On {where(cfg)}, check the API "
+                "settings and that the client id is free.",
                 "; ".join(self._api_errors[-3:]),
             ) from None
 
@@ -195,8 +229,9 @@ class IBConnection:
             await self.disconnect()
             raise IBUnavailable(
                 "not_logged_in",
-                "The API answered but reports no account. TWS is running without a "
-                "logged-in user, or is still loading — log in and retry.",
+                f"The API answered but reports no account. The TWS on {where(cfg)} is "
+                "running without a logged-in user, or is still loading — log in there "
+                "and retry.",
             )
         await self._ensure_account_updates()
 
@@ -249,7 +284,9 @@ class IBConnection:
         accounts = list(self._ib.managedAccounts())
         if not accounts:
             raise IBUnavailable(
-                "not_logged_in", "The API reports no account. Log in to TWS and retry."
+                "not_logged_in",
+                "The API reports no account. Log in to the TWS on "
+                f"{where(self._cfg)} and retry.",
             )
         raise AccountAmbiguous(accounts)
 
@@ -267,13 +304,14 @@ class IBConnection:
             if not accounts:
                 return {
                     "state": "not_logged_in",
-                    "hint": "Connected to the API but no account is logged in to TWS.",
+                    "hint": "Connected to the API but no account is logged in to the TWS "
+                    f"on {where(cfg)}.",
                     "connected": True,
                     "accounts": [],
                 }
             return {
                 "state": "connected",
-                "hint": "TWS is reachable and an account is logged in.",
+                "hint": f"TWS on {where(cfg)} is reachable and an account is logged in.",
                 "connected": True,
                 "accounts": list(accounts),
                 "serverVersion": self._ib.client.serverVersion(),
@@ -294,7 +332,7 @@ class IBConnection:
             return out
         return {
             "state": "connected",
-            "hint": "TWS is reachable and an account is logged in.",
+            "hint": f"TWS on {where(cfg)} is reachable and an account is logged in.",
             "connected": True,
             "accounts": list(self._ib.managedAccounts()),
             "serverVersion": self._ib.client.serverVersion(),
