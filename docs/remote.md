@@ -26,6 +26,112 @@ tested against.
 If a deployment ever prefers `uvicorn` on the command line against the ASGI
 app, it needs `--loop asyncio` to stay equivalent.
 
+## Deploying it
+
+The shape this is written for: one small host running all three of the IB
+Gateway, this server, and a reverse proxy. The server reaches the Gateway over
+loopback, which is what keeps `IBKR_CONNECT_TIMEOUT` and
+`IBKR_GREEKS_TIMEOUT` meaning what they were measured to mean — a split across
+two machines puts a network between the API socket and every greek.
+
+Roughly 4 GB of RAM. The Gateway is a JVM and wants about one on its own;
+numpy, scipy and a stress run want the rest without being tight about it.
+
+### 1. Two usernames, not one
+
+**Do this first, because everything else assumes it.** IB permits one live
+session per username: a Gateway logging in as you will disconnect your desktop
+TWS, and opening TWS will disconnect the Gateway. Create an additional user on
+the account in Client Portal, give the deployment that one, and keep your own
+for the desktop. Restrict the additional user's permissions while you are there
+— this server never needs order entry.
+
+### 2. The Gateway, under IBC
+
+IB Gateway is a Swing application and needs a display even when nobody is
+looking at it, so on a headless host it runs under Xvfb or a VNC server; IBC
+drives it and handles the login and the restart IB forces every day. Follow
+IBC's own installation notes rather than anything reproduced here — it is the
+part of this stack that changes most often.
+
+In the Gateway's API settings, once IBC has it running:
+
+- **Enable ActiveX and Socket Clients** — on. Nothing works until it is.
+- **Socket port** — 4001 live, 4002 paper.
+- **Trusted IPs** — `127.0.0.1` and nothing else. The server is on the same
+  host; no other machine has any business on that socket.
+- **Read-Only API** — **on**. `IBKR_ENABLE_WHATIF` is already false, which
+  opens the ib_async connection read-only, so this costs nothing and makes
+  order entry impossible one layer further down. Turn it off only if you later
+  decide you want `whatif_order`, and understand that it is the same switch
+  that blocks what-if margin requests.
+
+### 3. This server
+
+```bash
+git clone <repo> /opt/ibkr-risk-mcp && cd /opt/ibkr-risk-mcp
+uv venv && uv pip install -e .
+install -d -m 0700 /etc/ibkr-risk-mcp
+$EDITOR /etc/ibkr-risk-mcp/env      # see .env.example; IBKR_PORT=4001
+systemctl enable --now ibkr-risk-mcp
+```
+
+The unit is below. Start with `IBKR_MCP_AUTH=false` and check it locally —
+
+```bash
+uv run python scripts/http_smoke.py --live
+```
+
+— before putting anything in front of it. That separates "the Gateway is wrong"
+from "the proxy is wrong" from "the token is wrong", which is worth an extra
+five minutes given all three fail as "couldn't reach the MCP server".
+
+### 4. Carry the calibration across
+
+Easy to miss and silent when missed. The fitted `vol_coord` decay lives in a
+small JSON file on the machine that fitted it — on a desktop,
+`~/.ibkr-risk-mcp/vol_coord.json`. Copy it to the VPS, into the
+`StateDirectory` the unit below creates:
+
+```bash
+scp ~/.ibkr-risk-mcp/vol_coord.json vps:/var/lib/ibkr-risk-mcp/vol_coord.json
+```
+
+Then confirm it landed by calling `check_connection` and reading the
+`calibration` field. `null` there means the server is running on the factory
+decay — fitted against somebody else's Risk Navigator — and every stress curve
+is quietly less accurate than the ones you have been reading. Refitting with
+`calibrate_vol_coord` is the alternative, but copying is a second's work.
+
+### 5. TLS, and a firewall that assumes Anthropic
+
+Point an A record at the host, let Caddy get the certificate (see the
+Caddyfile below), then close everything else:
+
+```bash
+ufw default deny incoming
+ufw allow from <your address> to any port 22 proto tcp
+ufw allow from 160.79.104.0/21 to any port 443 proto tcp
+ufw enable
+```
+
+Only Anthropic ever needs to reach the MCP endpoint, so scoping 443 to their
+published egress range removes the rest of the internet from the set of things
+that can even reach a `401`. It is not a substitute for the token — an IP range
+is not an identity — but there is no reason to be reachable by anyone else.
+
+### 6. Turn on authentication
+
+Register the resource with your identity provider, set the four variables, and
+work through **Authentication** below — including *Finding your subject*, which
+is the step with a chicken-and-egg in it.
+
+### 7. Connect it
+
+Add a custom connector in Claude pointing at `https://<host>/mcp`, exactly as
+`IBKR_MCP_RESOURCE_URL` spells it. Then ask it something that costs nothing to
+be wrong about — `check_connection` — before you ask it where the trough is.
+
 ## The service unit
 
 ```ini
