@@ -383,9 +383,59 @@ nothing and removes the whole internet from the set of things that can reach a
 
 ### Choosing a provider
 
-Any OIDC provider works — the server only ever needs an issuer, a JWKS URL, an
-audience and a subject. That makes the choice low-stakes and reversible: moving
-providers is four environment variables.
+Any OIDC provider works *in principle* — the server only ever needs an issuer,
+a JWKS URL, an audience and a subject, so moving providers is four environment
+variables. In practice the field is narrower than that, and for one reason
+worth understanding before picking.
+
+**The audience is the problem.** This server requires a token whose `aud` is
+its own URL, because without that check a token your provider minted for some
+other application of yours would open this one. Claude asks for that by sending
+`resource=<your MCP URL>` on the authorization and token requests — RFC 8707,
+Resource Indicators. A provider that ignores the parameter issues a token with
+some other audience, or none, and every one of them is refused. A provider that
+issues *opaque* tokens rather than JWTs cannot be verified offline at all, and
+this server does no introspection.
+
+So the real requirements are: RFC 8414 discovery metadata, PKCE `S256`
+advertised, JWT access tokens verifiable against a JWKS, and Resource
+Indicators. Dynamic client registration is a convenience on top — without it
+you paste a pre-registered client ID and secret into Claude's advanced
+settings.
+
+**Two providers document all of this for MCP explicitly**, which is worth more
+than a feature list, because it means somebody has already walked the path:
+
+| | free tier | notes |
+|---|---|---|
+| **WorkOS AuthKit** | 1M MAU | Resource Indicators, DCR and CIMD are dashboard toggles under Connect → Configuration |
+| **Stytch Connected Apps** | 10k MAU | Same three, with MCP-specific documentation and guides |
+
+Either is free at one user, so cost is not the deciding factor — pick on which
+dashboard you'd rather read.
+
+**Auth0 and Microsoft Entra are the ones to be careful with.** Auth0 uses a
+proprietary `audience` parameter rather than RFC 8707's `resource`, and Entra
+requires the resource to be an App ID URI, which conflicts with the rule that
+the published `resource` must match the MCP server's own URL. Both are
+solvable; neither is a first choice for a first deployment.
+
+#### Two things to set that the defaults get wrong
+
+**The JWKS path.** This server defaults to
+`<issuer>/.well-known/jwks.json`, which is the common convention and not
+universal — WorkOS publishes at `<issuer>/oauth2/jwks`. Read the provider's
+`/.well-known/oauth-authorization-server` document and set
+`IBKR_MCP_AUTH_JWKS_URL` from its `jwks_uri` rather than trusting the default.
+
+**The scope name.** `IBKR_MCP_AUTH_SCOPE` is published in `scopes_supported`,
+and Claude asks the provider for it by name, so a provider that rejects unknown
+scopes will fail the authorization before a token exists. Either define
+`risk:read` as a permission in the provider, or set this to a scope the
+provider already issues. Doing the latter costs nothing in security: this
+server grants the scope itself to allowlisted subjects and never reads the
+token's scope claim, so the name is a label for the 401/403 distinction and
+nothing more.
 
 Claude's custom connectors will register themselves automatically with a
 provider that supports dynamic client registration (RFC 7591), which is the
