@@ -67,12 +67,27 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
-import jwt
-
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared._httpx_utils import create_mcp_http_client
+
+from mcp_remote_auth.smoke import (
+    AUTH_SUBJECT,
+    NOTABLE_ERRORS,
+    RESULTS,
+    SERVER_LOG,
+    _Done,
+    check_auth,
+    check_tools,
+    client,
+    free_port,
+    mint,
+    payload,
+    pump,
+    record,
+    spawn_server,
+    start_jwks_server,
+    summary,
+    wait_for_port,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -94,149 +109,21 @@ EXPECTED_TOOLS = {
 #: rather than a token three points so the timings below are of a real request.
 SHOCKS = [round(-0.30 + 0.01 * i, 2) for i in range(61)]
 
-#: IB error codes worth naming if they show up. 322 is the one this whole
+#: IB error codes worth naming if they show up. Registered with the shared
+#: harness so its summary can label them. 322 is the one this whole
 #: design is about: it is what TWS returns for market data requests beyond the
 #: line limit, and it is what the semaphore in `marketdata.py` exists to
 #: prevent. 10091 is an entitlement gap — the account's problem, not the
 #: server's, and not evidence of contention.
-NOTABLE_ERRORS = {
+NOTABLE_ERRORS.update({
     322: "market data line limit exceeded — the semaphore did not hold",
     420: "market data pacing violation",
     10091: "market data entitlement missing (account, not contention)",
     1100: "connection to TWS lost",
     1102: "connection restored",
     200: "no security definition for the request — a strike or expiry that is not listed",
-}
+})
 
-
-class _Done(Exception):
-    """Raised to end a run that has finished early, without it reading as a
-    failure in the handler below."""
-
-
-RESULTS: list[tuple[str, str, str]] = []
-SERVER_LOG: list[str] = []
-
-
-def record(status: str, step: str, detail: str = "") -> None:
-    RESULTS.append((status, step, detail))
-    print(f"{status:4} {step}" + (f" — {detail}" if detail else ""), flush=True)
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-async def pump(proc: asyncio.subprocess.Process, echo: bool) -> None:
-    """Keep the server's output, and optionally show it.
-
-    Kept regardless: the error codes IB sends are the only view this script has
-    of what TWS made of the requests, and they arrive on the server's log
-    rather than in any tool's reply.
-    """
-    assert proc.stdout is not None
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").rstrip()
-        SERVER_LOG.append(line)
-        if echo:
-            print(f"    | {line}", flush=True)
-
-
-def server_errors() -> dict[int, int]:
-    """IB error codes seen in the server log, with counts."""
-    counts: dict[int, int] = {}
-    for line in SERVER_LOG:
-        for match in re.finditer(r"\bError (\d{3,5})\b", line):
-            code = int(match.group(1))
-            counts[code] = counts.get(code, 0) + 1
-    return counts
-
-
-async def wait_for_port(port: int, proc: asyncio.subprocess.Process, timeout: float) -> None:
-    """Wait for the listener, or for the server to die trying.
-
-    Polling the port alone would spend the whole timeout on a server that
-    already exited — which is the common failure while this is being set up,
-    and the one whose traceback is worth surfacing.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if proc.returncode is not None:
-            raise RuntimeError(f"server exited with code {proc.returncode} before listening")
-        try:
-            _, writer = await asyncio.open_connection("127.0.0.1", port)
-        except OSError:
-            await asyncio.sleep(0.1)
-            continue
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
-        return
-    raise TimeoutError(f"nothing listening on 127.0.0.1:{port} after {timeout}s")
-
-
-def payload(result: Any) -> dict[str, Any]:
-    """The tool's dict, out of the MCP result envelope.
-
-    `structuredContent` is where a dict-returning tool lands; the text block is
-    the fallback for a server that did not send one.
-    """
-    if getattr(result, "structuredContent", None):
-        return dict(result.structuredContent)
-    for block in result.content:
-        if getattr(block, "type", None) == "text":
-            with contextlib.suppress(ValueError):
-                return json.loads(block.text)
-    return {}
-
-
-@contextlib.asynccontextmanager
-async def client(port: int, tool_timeout: float, token: str | None = None):
-    """An initialised session against the running server.
-
-    Every timeout is set explicitly and generously, through the factory rather
-    than through `streamablehttp_client`'s own `timeout=`/`sse_read_timeout=`
-    arguments, which are deprecated in this SDK version. The one that bites is
-    `read`: it bounds the gap between bytes arriving, so a tool that computes
-    in silence is held to it however fast the connection is. Raised here far
-    above anything measured, because this script's job is to report a slow
-    answer as a slow answer rather than to become the thing that fails.
-    """
-    url = f"http://127.0.0.1:{port}/mcp"
-
-    def factory(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
-        # The bearer token goes on every request rather than only on the
-        # handshake: stateless_http means each POST is authorised on its own,
-        # which is exactly the property worth exercising here.
-        merged = dict(headers or {})
-        if token:
-            merged["authorization"] = f"Bearer {token}"
-        return create_mcp_http_client(
-            headers=merged,
-            timeout=httpx.Timeout(30.0, read=tool_timeout),
-            auth=auth,
-        )
-
-    async with streamablehttp_client(url, httpx_client_factory=factory) as (read, write, _):
-        async with ClientSession(
-            read, write, read_timeout_seconds=timedelta(seconds=tool_timeout)
-        ) as session:
-            await session.initialize()
-            yield session
-
-
-async def check_transport(session: ClientSession) -> None:
-    listed = await session.list_tools()
-    names = {t.name for t in listed.tools}
-    missing = EXPECTED_TOOLS - names
-    extra = names - EXPECTED_TOOLS
-    if missing or extra:
-        record("FAIL", "tools/list", f"missing {sorted(missing)}, unexpected {sorted(extra)}")
-    else:
-        record("PASS", "tools/list", f"{len(names)} tools over HTTP")
 
 
 async def check_live(session: ClientSession) -> None:
@@ -557,152 +444,6 @@ async def check_mixed(
 # auth
 # --------------------------------------------------------------------------
 
-AUTH_SUBJECT = "smoke-test|allowed"
-AUTH_STRANGER = "smoke-test|stranger"
-
-
-def start_jwks_server() -> tuple[Any, int, Any]:
-    """A stand-in identity provider: one signing key, published over HTTP.
-
-    The unit tests in `tests/test_auth.py` cover what the verifier makes of a
-    token. What they cannot cover is whether the verifier is *attached* — and
-    an auth module that is configured, tested and simply never wired into the
-    app is the failure that looks exactly like success from the inside.
-    """
-    import json as _json
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    jwk = _json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
-    jwk.update({"kid": "smoke-1", "alg": "RS256", "use": "sig"})
-    body = _json.dumps({"keys": [jwk]}).encode()
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args: Any) -> None:
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return private, server.server_address[1], server
-
-
-def mint(private, *, sub: str, aud: str, iss: str, ttl: int = 300) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {"sub": sub, "aud": aud, "iss": iss, "iat": now, "exp": now + ttl},
-        private,
-        algorithm="RS256",
-        headers={"kid": "smoke-1"},
-    )
-
-
-async def check_auth(port: int, private, issuer: str, resource: str) -> None:
-    """The boundary, end to end over real HTTP. Needs no TWS: every request
-    here is decided before any tool runs."""
-    base = f"http://127.0.0.1:{port}"
-    initialize = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "http-smoke", "version": "0"},
-        },
-    }
-    headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
-
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        # Discovery, in the order a client performs it: knock, read where the
-        # challenge says to go, go there. Following the advertised URL rather
-        # than a hardcoded one is the point — RFC 9728 inserts the well-known
-        # segment *before* the resource path, so a server can serve correct
-        # metadata at a URL nothing it publishes actually names.
-        anonymous = await http.post(f"{base}/mcp", json=initialize, headers=headers)
-        challenge = anonymous.headers.get("www-authenticate", "")
-        advertised = re.search(r'resource_metadata="([^"]+)"', challenge)
-        if anonymous.status_code == 401 and advertised:
-            record("PASS", "unauthenticated request", "401 with a resource_metadata challenge")
-        else:
-            record(
-                "FAIL",
-                "unauthenticated request",
-                f"HTTP {anonymous.status_code}, WWW-Authenticate={challenge!r} — "
-                "expected 401 pointing at the metadata",
-            )
-
-        if advertised:
-            url = advertised.group(1)
-            meta = await http.get(url)
-            document = meta.text
-            if meta.status_code == 200 and resource.rstrip("/") in document:
-                record(
-                    "PASS",
-                    "RFC 9728 metadata",
-                    f"the advertised URL resolves and names the resource ({url})",
-                )
-            else:
-                record(
-                    "FAIL",
-                    "RFC 9728 metadata",
-                    f"{url} answered HTTP {meta.status_code}: {document[:200]}",
-                )
-
-        good = mint(private, sub=AUTH_SUBJECT, aud=resource, iss=issuer)
-        ok = await http.post(
-            f"{base}/mcp", json=initialize, headers={**headers, "authorization": f"Bearer {good}"}
-        )
-        if ok.status_code == 200:
-            record("PASS", "allowlisted subject", "200, the session initialises")
-        else:
-            record("FAIL", "allowlisted subject", f"HTTP {ok.status_code}: {ok.text[:200]}")
-
-        stranger = mint(private, sub=AUTH_STRANGER, aud=resource, iss=issuer)
-        refused = await http.post(
-            f"{base}/mcp",
-            json=initialize,
-            headers={**headers, "authorization": f"Bearer {stranger}"},
-        )
-        if refused.status_code == 403:
-            record(
-                "PASS",
-                "valid token, wrong subject",
-                "403 insufficient_scope — not a 401, so the client does not re-auth in a loop",
-            )
-        else:
-            record(
-                "FAIL",
-                "valid token, wrong subject",
-                f"HTTP {refused.status_code}: expected 403, got {refused.text[:200]}",
-            )
-
-        for label, token_value in (
-            ("expired token", mint(private, sub=AUTH_SUBJECT, aud=resource, iss=issuer, ttl=-60)),
-            (
-                "token for another audience",
-                mint(private, sub=AUTH_SUBJECT, aud="https://elsewhere.example.com", iss=issuer),
-            ),
-            ("garbage token", "not-even-a-jwt"),
-        ):
-            response = await http.post(
-                f"{base}/mcp",
-                json=initialize,
-                headers={**headers, "authorization": f"Bearer {token_value}"},
-            )
-            if response.status_code == 401:
-                record("PASS", label, "401")
-            else:
-                record("FAIL", label, f"HTTP {response.status_code}: expected 401")
 
 
 # --------------------------------------------------------------------------
@@ -802,23 +543,12 @@ async def run(args: argparse.Namespace) -> int:
             "IBKR_MCP_AUTH_AUDIENCE": auth_resource,
             "IBKR_MCP_ALLOWED_SUBJECTS": AUTH_SUBJECT,
         }
-    env = {
-        **os.environ,
-        "IBKR_MCP_TRANSPORT": "http",
-        "IBKR_MCP_HOST": "127.0.0.1",
-        "IBKR_MCP_PORT": str(port),
-        **auth_env,
-        "PYTHONPATH": str(ROOT / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""),
-        "PYTHONUNBUFFERED": "1",
-    }
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
+    proc = await spawn_server(
+        ROOT,
         "from ibkr_risk_mcp.server import main; main()",
-        env=env,
-        cwd=str(ROOT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        port,
+        "IBKR_MCP_",
+        extra_env=auth_env,
     )
     pumping = asyncio.create_task(pump(proc, echo=args.server_log))
     try:
@@ -846,7 +576,7 @@ async def run(args: argparse.Namespace) -> int:
                 "session established over streamable HTTP"
                 + (", bearer token accepted" if session_token else ""),
             )
-            await check_transport(session)
+            await check_tools(session, EXPECTED_TOOLS)
             if args.live or args.concurrent:
                 await check_live(session)
         if args.concurrent:
@@ -870,17 +600,7 @@ async def run(args: argparse.Namespace) -> int:
         with contextlib.suppress(asyncio.CancelledError):
             await pumping
 
-    codes = server_errors()
-    if codes:
-        print()
-        print("IB error codes in the server log:")
-        for code, count in sorted(codes.items()):
-            print(f"  {code} x{count}  {NOTABLE_ERRORS.get(code, '')}")
-
-    failed = [r for r in RESULTS if r[0] == "FAIL"]
-    print()
-    print(f"{len(RESULTS)} steps, {len(failed)} failed")
-    return 1 if failed else 0
+    return summary()
 
 
 def cli() -> int:

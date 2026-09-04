@@ -366,7 +366,7 @@ startup errors here rather than mysteries later.
    key of their own, and every token check after that is theatre.
 3. **Your provider must know the scope this server advertises.** Claude
    requests whatever is in `scopes_supported`, which here is
-   `IBKR_MCP_AUTH_SCOPE` — `risk:read` by default. Define it as a permission on
+   `IBKR_MCP_AUTH_SCOPE` — `openid` by default. Define it as a permission on
    the API you registered, or the authorization request may be rejected before
    a token is ever minted. Note this is separate from the scope *check*: the
    server grants `risk:read` itself to allowlisted subjects and never reads the
@@ -430,12 +430,13 @@ universal — WorkOS publishes at `<issuer>/oauth2/jwks`. Read the provider's
 
 **The scope name.** `IBKR_MCP_AUTH_SCOPE` is published in `scopes_supported`,
 and Claude asks the provider for it by name, so a provider that rejects unknown
-scopes will fail the authorization before a token exists. Either define
-`risk:read` as a permission in the provider, or set this to a scope the
-provider already issues. Doing the latter costs nothing in security: this
-server grants the scope itself to allowlisted subjects and never reads the
-token's scope claim, so the name is a label for the 401/403 distinction and
-nothing more.
+scopes will fail the authorization before a token exists. It defaults to
+`openid`, which every OIDC provider issues — WorkOS AuthKit, for instance,
+offers only `email`, `offline_access`, `openid` and `profile`. A custom name
+works if you define it as a permission at the provider first. Either way it
+costs nothing in security: this server grants the scope itself to allowlisted
+subjects and never reads the token's scope claim, so the name is a label for
+the 401/403 distinction and nothing more.
 
 Claude's custom connectors will register themselves automatically with a
 provider that supports dynamic client registration (RFC 7591), which is the

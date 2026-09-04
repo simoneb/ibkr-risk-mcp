@@ -303,12 +303,11 @@ name = "ibkr-risk-mcp"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
-    { name = "httpx" },
     { name = "ib-async" },
     { name = "mcp" },
+    { name = "mcp-remote-auth" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pyjwt", extra = ["crypto"] },
     { name = "python-dotenv" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -316,17 +315,20 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "ib-async", specifier = ">=1.0.3,<3.0" },
     { name = "mcp", specifier = ">=1.10.0,<2.0" },
+    { name = "mcp-remote-auth", editable = "../mcp-remote-auth" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.8,<3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<9.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23,<2.0" },
     { name = "python-dotenv", specifier = ">=1.0,<2.0" },
@@ -403,6 +405,28 @@ sdist = { url = "https://files.pythonhosted.org/packages/30/d3/f9acc21dfc886e4f7
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/c8/248b201f6d753d69fd5d6506011abbb35a946d9142b2ae311a948fd0be3d/mcp-1.29.0-py3-none-any.whl", hash = "sha256:f5a075bb611f23d6f4d080c6a1699fa62772eebc562ba9e66b306ddde1c755f7", size = 223436, upload-time = "2026-07-28T13:41:40.337Z" },
 ]
+
+[[package]]
+name = "mcp-remote-auth"
+version = "0.1.0"
+source = { editable = "../mcp-remote-auth" }
+dependencies = [
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "pydantic" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "mcp", specifier = ">=1.10.0,<2.0" },
+    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<9.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23,<2.0" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "nest-asyncio"

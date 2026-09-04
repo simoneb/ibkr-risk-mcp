@@ -13,18 +13,17 @@ import functools
 import logging
 from typing import Any, Callable, Literal, Sequence
 
-from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp_remote_auth import run as serve, transport_kwargs
 from mcp.types import ToolAnnotations
-from pydantic import AliasChoices, AnyHttpUrl, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from . import marketdata as MD
 from . import stress as S
 from . import contracts as C
 from . import margin as M
 from . import calibration as CAL
-from .auth import verifier_for
-from .config import settings
+from .config import remote, settings
 from .connection import AccountAmbiguous, IBUnavailable, connection
 
 logging.basicConfig(level=logging.WARNING)
@@ -32,42 +31,16 @@ logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger(__name__)
 
 
-def _auth_settings() -> AuthSettings | None:
-    """The SDK's auth configuration, or None when auth is off.
-
-    Passing this alongside a token verifier is all it takes to become a
-    conformant resource server: the SDK mounts
-    /.well-known/oauth-protected-resource (RFC 9728) and answers an
-    unauthenticated request with the `WWW-Authenticate: Bearer
-    resource_metadata=...` challenge that points a client at it. Token
-    issuance, authorization-server metadata and client registration stay with
-    the provider, where they belong — this server never sees a credential.
-    """
-    if not settings.mcp_auth:
-        return None
-    return AuthSettings(
-        issuer_url=AnyHttpUrl(settings.mcp_auth_issuer),  # type: ignore[arg-type]
-        resource_server_url=AnyHttpUrl(settings.mcp_resource_url),  # type: ignore[arg-type]
-        required_scopes=[settings.mcp_auth_scope],
-    )
-
-
+# Stateless is the right default here and the reason is specific: everything
+# this server holds between calls — the IB connection, the market data
+# semaphore, the contract details cache, the stored calibration — is
+# process-global by design and deliberately shared by every caller, because TWS
+# keys API sessions by client id and will not give a second connection to the
+# same one. A request that lands without a session id has lost nothing it would
+# have had with one.
 mcp = FastMCP(
     "ibkr-risk-mcp",
-    host=settings.mcp_host,
-    port=settings.mcp_port,
-    streamable_http_path=settings.mcp_path,
-    token_verifier=verifier_for(settings),
-    auth=_auth_settings(),
-    # Session affinity buys this server nothing. Everything it holds between
-    # calls — the IB connection, the market data semaphore, the contract
-    # details cache, the stored calibration — is process-global by design and
-    # is deliberately shared by every caller, because TWS keys API sessions by
-    # client id and will not give a second connection to the same one. So a
-    # request that lands without a session id has lost nothing it would have
-    # had with one, and dropping the requirement removes a whole class of
-    # "session expired" failure from a client's path to a P&L curve.
-    stateless_http=True,
+    **transport_kwargs(remote),
     instructions="""This server exposes Interactive Brokers' *risk* data: model greeks,
 IB's implied volatility surface, what-if margin, and a local stress engine that
 rebuilds the portfolio P&L curve across underlying shocks.
@@ -1078,32 +1051,7 @@ async def whatif_order(
 
 
 def main() -> None:
-    """Serve, over whichever transport was configured.
-
-    The HTTP branch runs uvicorn from inside ``mcp.run``, which awaits
-    ``Server.serve()`` on the loop it is already on rather than calling
-    ``uvicorn.run()``. That matters more than it looks: ``uvicorn.run`` selects
-    ``loop="auto"``, which is uvloop wherever uvloop is installed, and ib_async
-    drives its own socket transport on whatever loop it finds. Keeping the
-    process on plain asyncio keeps ib_async on the loop it is tested against.
-    A future deployment that prefers the uvicorn CLI over this entry point
-    needs ``--loop asyncio`` to stay equivalent.
-    """
-    if settings.mcp_transport == "http":
-        # basicConfig above pins the root at WARNING, which is right for a
-        # subprocess talking MCP over a pipe and wrong for a service somebody
-        # has to find the endpoint of. The handler itself has no level, so
-        # lifting this logger is enough to let the line through.
-        log.setLevel(logging.INFO)
-        log.info(
-            "serving MCP over streamable HTTP at http://%s:%s%s",
-            settings.mcp_host,
-            settings.mcp_port,
-            settings.mcp_path,
-        )
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
+    serve(mcp, remote)
 
 
 if __name__ == "__main__":

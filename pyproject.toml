@@ -28,28 +28,30 @@ classifiers = [
   "Topic :: Office/Business :: Financial :: Investment",
 ]
 dependencies = [
-  # 1.10 is the floor for the OAuth resource-server surface: AuthSettings grew
-  # `resource_server_url` there, and with it the RFC 9728 metadata route and
-  # the WWW-Authenticate challenge that the auth module relies on the SDK to
-  # serve. Verified against the 1.9.4 and 1.10.0 wheels.
   "mcp>=1.10.0,<2.0",
+  # The HTTP transport and its bearer-token boundary. Shared with the other
+  # servers rather than copied into each, because a security boundary that
+  # exists twice gets fixed once.
+  "mcp-remote-auth @ git+https://github.com/simoneb/mcp-remote-auth@v0.1.0",
   "ib-async>=1.0.3,<3.0",
   "numpy>=1.26",
   "scipy>=1.11",
   "python-dotenv>=1.0,<2.0",
-  # Both arrive transitively with mcp today, and both are imported directly by
-  # `auth`, which makes them ours to pin rather than ours to inherit. The
-  # `crypto` extra is what supplies RS256 and friends; PyJWT without it can
-  # only do HMAC, which this server refuses.
-  "pyjwt[crypto]>=2.8,<3.0",
-  "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0,<9.0", "pytest-asyncio>=0.23,<2.0"]
+# httpx and pyjwt arrive with mcp-remote-auth for the server itself; they are
+# listed here because scripts/http_smoke.py imports them directly.
+dev = ["pytest>=8.0,<9.0", "pytest-asyncio>=0.23,<2.0", "httpx>=0.27", "pyjwt[crypto]>=2.8,<3.0"]
 
 [project.scripts]
 ibkr-risk-mcp = "ibkr_risk_mcp.server:main"
+
+# Local development against the shared package. This is a uv-only override: it
+# does not appear in the published metadata, so the dependency above stays a
+# proper pin while edits here are visible immediately in both servers.
+[tool.uv.sources]
+mcp-remote-auth = { path = "../mcp-remote-auth", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
