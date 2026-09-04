@@ -274,6 +274,17 @@ of hanging until the client gives up — while nothing real ever reaches it.
 Leaving both unset is also defensible; what is not defensible is setting them
 to a number nobody compared against the table above.
 
+**One thing the proxy makes you configure elsewhere.** The MCP SDK validates
+the `Host` header for DNS-rebinding protection, and derives what to accept from
+the bind address — so binding loopback, as above, leaves it accepting only
+`127.0.0.1`. Caddy forwards the *public* Host, so without intervention every
+proxied request is answered `421 Misdirected Request`. This server handles it:
+the public host is taken from `IBKR_MCP_RESOURCE_URL` and added to the allowed
+set. Worth knowing it exists, because it hides — authentication is checked
+first, so while a token is being refused the request never reaches the Host
+check, and the fault surfaces on the first request that authenticates
+successfully.
+
 Response buffering needs no configuration: Caddy flushes immediately when the
 response is `Content-Type: text/event-stream` or has an unknown
 `Content-Length`, which covers streamable HTTP's streaming replies. Adding

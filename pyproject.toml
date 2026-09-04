@@ -32,7 +32,7 @@ dependencies = [
   # The HTTP transport and its bearer-token boundary. Shared with the other
   # servers rather than copied into each, because a security boundary that
   # exists twice gets fixed once.
-  "mcp-remote-auth @ git+https://github.com/simoneb/mcp-remote-auth@v0.1.0",
+  "mcp-remote-auth @ git+https://github.com/simoneb/mcp-remote-auth@v0.1.1",
   "ib-async>=1.0.3,<3.0",
   "numpy>=1.26",
   "scipy>=1.11",
